@@ -9,9 +9,9 @@
 # - Auto-refresh UI; HTTP snapshot refresh cadence is configurable (default = never, to save quota)
 #
 # Docs used:
-# - Live v2 (US extended quotes): endpoint, s= batching, fields (open, lastTradePrice), 1 call / symbol.  (https://eodhd.com/api/us-quote-delayed)  [See EODHD docs page "Live v2 for US Stocks: Extended Quotes (2025)"]
-# - WebSockets: wss://ws.eodhistoricaldata.com/ws/us?api_token=..., subscribe/unsubscribe JSON; ~50 symbols/connection by default; WS does NOT consume API calls.
-# - API limits: daily calls counted per symbol, 100k/day default.
+# - Live v2 (US extended quotes): endpoint /api/us-quote-delayed, s= batching, fields (open, lastTradePrice), 1 call / ticker, page[limit]≤100.  [EODHD "Live v2 for US Stocks: Extended Quotes (2025)"]
+# - WebSockets: wss://ws.eodhistoricaldata.com/ws/us?api_token=..., subscribe/unsubscribe JSON; ~50 symbols/connection by default; WS does NOT consume API calls.  [EODHD "Real-Time Data API via WebSockets"]
+# - API limits: daily calls counted per symbol, 100k/day default.  [EODHD "API Limits"]
 # -----------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ BASE_HOST = "https://eodhd.com"
 LIVE_V2_URL = f"{BASE_HOST}/api/us-quote-delayed"   # US extended quotes (delayed); includes 'open' and 'lastTradePrice'
 
 HTTP_BATCH = 100           # Live v2: page[limit] max 100
-DEFAULT_WS_WINDOW = 50     # per EODHD docs: 50 concurrent symbols per connection by default
+DEFAULT_WS_WINDOW = 50     # per EODHD docs: ~50 concurrent symbols per connection by default
 DEFAULT_WS_DWELL = 2       # seconds to sit on each WS rotation slice
 CACHE_TTL_LIVEV2 = 60 * 60 * 6   # 6h; 'open' is fixed after regular open, lastTradePrice is WS-overridden
 
@@ -160,6 +160,22 @@ with st.sidebar:
         "Refresh Live v2 HTTP snapshot every N minutes (0 = never, save quota)",
         min_value=0, max_value=120, value=0, step=5,
         help="Live v2 costs 1 API call per ticker (batched). Keep 0 to avoid burning calls."
+    )
+
+    # --- NEW: robust evaluation controls (metrics only; no API calls) ---
+    st.write("**Evaluation metrics (robust)**")
+    metrics_topk = st.slider(
+        "Top-K for metrics (used for medians & win rate)",
+        min_value=5,
+        max_value=int(min(200, max(5, top_n))),
+        value=int(min(20, top_n)),
+        step=5,
+        help="Applies to Top/Bottom median returns and Top-K win rate."
+    )
+    winsor_tail_pct = st.slider(
+        "Winsorize tails of 'return_open_to_now' (%) for metrics",
+        min_value=0, max_value=10, value=1, step=1,
+        help="Clips bottom/top tails for metrics only. Spearman/Kendall are rank-based (already robust)."
     )
 
 # -----------------------
@@ -476,6 +492,153 @@ show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
 
 # -----------------------
+# NEW: Robust rank⇄return metrics (no API calls; in-memory)
+# -----------------------
+def _winsorize_series(s: pd.Series, p: float) -> pd.Series:
+    """Clip s to [p, 1-p] quantiles; p in [0, 0.5)."""
+    s = pd.to_numeric(s, errors="coerce")
+    if p <= 0 or s.dropna().empty:
+        return s
+    lo, hi = s.quantile([p, 1 - p])
+    return s.clip(lower=lo, upper=hi)
+
+def _pearson_corr(a: pd.Series, b: pd.Series) -> float:
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    m = a.notna() & b.notna()
+    if m.sum() < 2:
+        return np.nan
+    ax = a[m] - a[m].mean()
+    bx = b[m] - b[m].mean()
+    denom = np.sqrt((ax**2).sum() * (bx**2).sum())
+    return float((ax * bx).sum() / denom) if denom > 0 else np.nan
+
+def _spearman_corr(a: pd.Series, b: pd.Series) -> float:
+    """Spearman via Pearson of ranks (average-tie method)."""
+    ar = a.rank(method="average")
+    br = b.rank(method="average")
+    return _pearson_corr(ar, br)
+
+def _kendall_tau_b(x: pd.Series, y: pd.Series) -> float:
+    """Naive O(n^2) Kendall tau-b; fine for typical top-N≤~1000."""
+    d = pd.DataFrame({"x": pd.to_numeric(x, errors="coerce"),
+                      "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    n = len(d)
+    if n < 2:
+        return np.nan
+    xv = d["x"].to_numpy()
+    yv = d["y"].to_numpy()
+    C = 0  # concordant
+    D = 0  # discordant
+    for i in range(n - 1):
+        dx = xv[i+1:] - xv[i]
+        dy = yv[i+1:] - yv[i]
+        prod = dx * dy
+        C += int((prod > 0).sum())
+        D += int((prod < 0).sum())
+    # tie corrections
+    n0 = n * (n - 1) // 2
+    counts_x = pd.Series(xv).value_counts().to_numpy()
+    counts_y = pd.Series(yv).value_counts().to_numpy()
+    n1 = int(((counts_x * (counts_x - 1)) // 2).sum())
+    n2 = int(((counts_y * (counts_y - 1)) // 2).sum())
+    denom = np.sqrt((n0 - n1) * (n0 - n2))
+    return float((C - D) / denom) if denom > 0 else np.nan
+
+def _theil_sen_slope_via_deciles(x: pd.Series, y: pd.Series, bins: int = 10) -> float:
+    """
+    Robust Theil–Sen slope of y vs x computed on decile medians to avoid O(n^2).
+    Returns slope only. If insufficient points, returns np.nan.
+    """
+    d = pd.DataFrame({"x": pd.to_numeric(x, errors="coerce"),
+                      "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    if d.shape[0] < 3:
+        return np.nan
+    bins = int(max(3, min(bins, d.shape[0] // 2)))
+    # bin by rank to evenly spread observations
+    # labels 1..bins with 1 = lowest x; we want x increasing with "better", so we will pass x as (-rank)
+    try:
+        q = pd.qcut(d["x"].rank(method="first"), q=bins, labels=False, duplicates="drop")
+    except Exception:
+        q = pd.cut(d["x"], bins=bins, labels=False, duplicates="drop")
+    g = d.assign(bin=q).groupby("bin", as_index=False).agg(x_med=("x", "median"), y_med=("y", "median")).dropna()
+    xv = g["x_med"].to_numpy()
+    yv = g["y_med"].to_numpy()
+    m = len(xv)
+    if m < 3:
+        return np.nan
+    slopes = []
+    for i in range(m - 1):
+        dx = xv[i+1:] - xv[i]
+        dy = yv[i+1:] - yv[i]
+        valid = dx != 0
+        if np.any(valid):
+            slopes.extend((dy[valid] / dx[valid]).tolist())
+    return float(np.median(slopes)) if slopes else np.nan
+
+def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute robust rank↔return metrics; returns (metrics_table, deciles_table)."""
+    ready = df[["rank", "prediction", "return_open_to_now"]].dropna().copy()
+    st.caption(f"📐 Metrics-ready rows (after NA drop): {ready.shape}")
+
+    if ready.empty:
+        return pd.DataFrame(columns=["metric", "value"]), pd.DataFrame(columns=["decile", "median_return"])
+
+    # Use negative rank so "higher is better" for correlation orientation
+    ready["neg_rank"] = -ready["rank"].astype(float)
+
+    # Winsorize returns for Pearson-style only (Spearman/Kendall are rank-based)
+    p = max(0.0, min(0.5, float(winsor_pct) / 100.0))
+    ret_w = _winsorize_series(ready["return_open_to_now"], p)
+
+    # Correlations
+    spearman = _spearman_corr(ready["neg_rank"], ready["return_open_to_now"])
+    kendall  = _kendall_tau_b(ready["neg_rank"], ready["return_open_to_now"])
+    pearson_w = _pearson_corr(ready["neg_rank"], ret_w)
+
+    # Theil–Sen slope (robust): y vs x where x = -rank
+    ts_slope = _theil_sen_slope_via_deciles(ready["neg_rank"], ready["return_open_to_now"], bins=10)
+    bps_per_10rank = (ts_slope * 10.0) * 10000.0 if pd.notna(ts_slope) else np.nan
+
+    # Top/Bottom-K medians + win rate
+    k = int(min(topk, ready.shape[0] // 2 if ready.shape[0] >= 2 else topk))
+    top = ready.nsmallest(k, "rank")  # rank 1..k
+    bot = ready.nlargest(k, "rank")
+    top_med = float(top["return_open_to_now"].median()) if not top.empty else np.nan
+    bot_med = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
+    l_s_med = top_med - bot_med if pd.notna(top_med) and pd.notna(bot_med) else np.nan
+    top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
+
+    metrics_rows = [
+        ("Spearman ρ (−rank vs return)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
+        ("Kendall τ-b (−rank vs return)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
+        (f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—"),
+        ("Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—"),
+        ("≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—"),
+        (f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—"),
+        (f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—"),
+        (f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
+        (f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
+    ]
+    metrics_tbl = pd.DataFrame(metrics_rows, columns=["metric", "value"])
+
+    # Deciles by rank: 1 (best) → D (worst)
+    D = int(min(10, max(3, ready.shape[0] // 10)))
+    ready["decile"] = pd.qcut(ready["rank"], q=D, labels=False, duplicates="drop") if ready["rank"].nunique() > 1 else 0
+    # make 0 = best rank bucket
+    deciles = (ready
+               .groupby("decile", as_index=False)
+               .agg(median_return=("return_open_to_now", "median"),
+                    count=("return_open_to_now", "size"))
+               .sort_values("decile"))
+    deciles["bucket"] = deciles["decile"].astype(int) + 1  # 1..D
+    deciles = deciles[["bucket", "count", "median_return"]]
+    deciles.rename(columns={"bucket": f"rank_decile(1=best, D={deciles.shape[0]})"}, inplace=True)
+    return metrics_tbl, deciles
+
+metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_tail_pct)
+
+# -----------------------
 # UI
 # -----------------------
 st.title("📈 Live LTR Monitor — Predictions vs Open→Now Returns (EODHD, rotating WS)")
@@ -522,6 +685,25 @@ with right:
         f"mode:            {'HTTP + rotating WS' if ws_enabled else 'HTTP (delayed only)'}",
         language="text",
     )
+
+st.write("---")
+met_left, met_right = st.columns([2, 3], gap="large")
+with met_left:
+    st.subheader("🧪 Robust rank⇄return metrics (today)")
+    if not metrics_tbl.empty:
+        st.dataframe(metrics_tbl, use_container_width=True, height=330)
+    else:
+        st.info("Metrics unavailable (no non-NA returns yet).")
+
+with met_right:
+    st.subheader("Rank deciles → median returns")
+    if not deciles_tbl.empty:
+        # Format and show decile medians to visualize monotonicity
+        deciles_fmt = deciles_tbl.copy()
+        deciles_fmt["median_return"] = deciles_fmt["median_return"].apply(_fmt_pct)
+        st.dataframe(deciles_fmt, use_container_width=True, height=330)
+    else:
+        st.info("Decile table unavailable (insufficient rows).")
 
 # Download
 csv_buf = io.StringIO()

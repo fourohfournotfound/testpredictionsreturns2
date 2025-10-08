@@ -5,9 +5,9 @@ requests==2.32.3
 python-dateutil==2.9.0.post0
 pytz==2024.1
 
-# Pin an ABI-compatible pair to avoid pandas/_libs import crashes
+# ABI-compatible pair (works well on Cloud)
 numpy==2.0.2
 pandas==2.2.2
 
-# Optional real-time WebSockets override for EODHD
-eodhdc==1.1.0
+# WebSocket client (we use EODHD endpoints directly)
+websocket-client==1.8.0

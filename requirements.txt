@@ -1,6 +1,9 @@
+streamlit
+streamlit-autorefresh
 pandas
 numpy
-pytz
 python-dateutil
-alpaca-py
-streamlit-autorefresh
+pytz
+requests
+# optional for realtime
+eodhdc>=1.1.0

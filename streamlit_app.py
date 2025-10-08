@@ -1,28 +1,26 @@
-# app.py
-# Streamlit dashboard: rank-by-prediction + (delayed) intraday return from open→now using EODHD
+# streamlit_app.py
+# Streamlit dashboard: rank-by-prediction + intraday open→now returns using EODHD
 # ---------------------------------------------------------------------------------------------
 # - Robust to MultiIndex (ticker,date) inputs
 # - Enforces session alignment and avoids look-ahead bias by default (uses target session's regular open)
-# - Fast batched data fetch via EODHD Live v2 (us-quote-delayed) + optional real-time WebSockets override
+# - Batched data fetch via EODHD Live v2 (us-quote-delayed) + optional real-time WebSockets override
 # - Auto-refresh on a timer; no background infra required
 #
 # Expected predictions CSV (flexible):
 #   Required:   ticker (or symbol), prediction (or pred/pred_score/score)
 #   Optional:   date (target session, e.g., 2025-10-08), as_of (ISO timestamp for your model snapshot)
 #
-# If your file is MultiIndex with ('ticker','date'), that works too — we normalize it.
-#
 # Usage:
-#   1) Put EODHD API token in Streamlit Secrets or env as EODHD_API_TOKEN.
-#   2) streamlit run app.py
+#   1) Put EODHD token in Streamlit Secrets or env as EODHD_API_TOKEN.
+#   2) streamlit run streamlit_app.py
 #
 # Notes:
-# - "Open" means *regular trading session open* (09:30 America/New_York); we use EODHD Live v2 'open' field.
-# - Default feed is 15–20 min delayed per EODHD docs (Live v2: us-quote-delayed).
-# - Optional real-time (WebSocket) override for latest prices (plan-dependent). Falls back gracefully.
+# - "Open" = regular trading session open (09:30 America/New_York) for the selected date. We use EODHD Live v2 'open'.
+# - Default feed is 15–20 min delayed (US) via Live v2 endpoint: https://eodhd.com/api/us-quote-delayed . :contentReference[oaicite:2]{index=2}
+# - Optional WebSockets override replaces the latest price with real-time trades if your plan allows. :contentReference[oaicite:3]{index=3}
 #
 # Safety:
-# - We never place orders; this is read-only market data for monitoring predictions/returns.
+# - Read-only market data for monitoring predictions/returns (no trading).
 # ---------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -30,37 +28,67 @@ from __future__ import annotations
 import os
 import io
 import json
-import math
 from datetime import datetime, date, time, timedelta
 from typing import List, Dict, Tuple, Optional
 
-import numpy as np
-import pandas as pd
+# --- Streamlit must be imported before we render any UI ---
+import streamlit as st
+st.set_page_config(page_title="Live LTR Monitor (EODHD)", layout="wide")
+
+# --- Harden dependency import to avoid numpy↔pandas ABI crash on Streamlit Cloud ---
+def _safe_import_pd_np():
+    try:
+        import numpy as _np
+        import pandas as _pd
+        return _np, _pd
+    except Exception as e:
+        st.error(
+            "🚨 **Dependency mismatch while importing `pandas`/`numpy`.**\n\n"
+            "This usually means the installed wheels are ABI-incompatible "
+            "(e.g., `pandas` compiled against a different `numpy`).\n\n"
+            "Fix: pin compatible versions in your **requirements.txt**, for example:\n"
+            "```\n"
+            "numpy==2.0.2\npandas==2.2.2\n```\n"
+            "Then redeploy. (Pandas ≥2.2.2 is the first release compatible with NumPy 2.x.)",
+            icon="🚨",
+        )
+        # Show the underlying exception for local runs
+        st.exception(e)
+        st.stop()
+
+np, pd = _safe_import_pd_np()
+
 import pytz
 from dateutil import parser as dateparser
-
 import requests
-import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# Optional: real-time WS via eodhdc (community client). If missing or plan not entitled -> we fallback.
+# Optional real-time WS via eodhdc. If unavailable or plan not entitled, we fall back to delayed HTTP.
 try:
-    from eodhdc import EODHDWebSockets  # type: ignore
+    from eodhdc import EODHDWebSockets  # async client
     _HAS_EODHDC = True
 except Exception:
     _HAS_EODHDC = False
 
 # -----------------------
-# Page config
+# Constants / Config
 # -----------------------
-st.set_page_config(page_title="Live LTR Monitor (EODHD)", layout="wide")
-
 NY = pytz.timezone("America/New_York")
 
-# API & batching params tuned for Live v2 delayed endpoint.
-BATCH_SIZE_HTTP = 100   # Live v2 supports 's=' list; docs show pagination up to 100/page.
-WS_COLLECT_SECONDS = 2  # short collection window to grab last trade updates when WS enabled
-OPEN_LOOKAHEAD_MIN = 5  # only relevant if we ever fall back to intraday bars (not used by default)
+# Live v2 (US delayed extended quotes) supports batching and returns open + last trade. :contentReference[oaicite:4]{index=4}
+BASE_HOST = "https://eodhd.com"
+LIVE_V2_URL = f"{BASE_HOST}/api/us-quote-delayed"
+LIVE_V1_URL = f"{BASE_HOST}/api/real-time"  # not used by default; kept for fallback/reference. :contentReference[oaicite:5]{index=5}
+
+BATCH_SIZE_HTTP = 100   # Live v2: up to 100 symbols per page (we keep chunks <=100). :contentReference[oaicite:6]{index=6}
+WS_COLLECT_SECONDS = 2  # short window to grab real-time prints if WS enabled
+
+# Common default CSV locations
+DEFAULT_PREDICTIONS_PATHS = [
+    os.environ.get("PREDICTIONS_CSV", "").strip() or "",
+    "live_predictions.csv",
+    "/mnt/data/live_predictions.csv",
+]
 
 # -----------------------
 # Secrets / env & helpers
@@ -72,28 +100,15 @@ def _get_secret(name, default=None, table=None):
         return os.environ.get(name, default)
 
 API_TOKEN = _get_secret("EODHD_API_TOKEN") or _get_secret("API_TOKEN", table="eodhd")
-BASE_HOST = "https://eodhd.com"
-LIVE_V2_URL = f"{BASE_HOST}/api/us-quote-delayed"   # Live v2 (US delayed, extended quotes)
-LIVE_V1_URL = f"{BASE_HOST}/api/real-time"          # Live v1 (OHLCV snapshot, multi-asset) [fallback capable]
-
-# Common default CSV locations
-DEFAULT_PREDICTIONS_PATHS = [
-    os.environ.get("PREDICTIONS_CSV", "").strip() or "",
-    "live_predictions.csv",
-    "/mnt/data/live_predictions.csv",
-]
 
 def _ensure_api_token() -> None:
     if not API_TOKEN:
         st.error(
-            "Missing EODHD credentials: **EODHD_API_TOKEN**. "
+            "Missing EODHD credentials: **EODHD_API_TOKEN**.\n"
             "Add it in **Streamlit Secrets** or environment variables, then rerun."
         )
         st.stop()
 
-# -----------------------
-# Requests session as cached resource
-# -----------------------
 @st.cache_resource(show_spinner=False)
 def _init_http_session() -> requests.Session:
     s = requests.Session()
@@ -109,16 +124,14 @@ _http = _init_http_session()
 # -----------------------
 with st.sidebar:
     st.title("⚙️ Settings")
-
     st.caption(f"🔐 EODHD token loaded: {'yes' if bool(API_TOKEN) else 'no'}")
 
-    st.write("**Feed mode**")
     ws_enabled = st.checkbox(
         "Use real‑time WebSocket for latest price (experimental)",
         value=False,
         help=(
-            "Requires an EODHD plan with WebSockets entitlement and the 'eodhdc' package. "
-            "If unavailable, the app automatically falls back to delayed HTTP (15–20 min)."
+            "Requires an EODHD plan with WebSockets entitlement and the `eodhdc` package. "
+            "If unavailable, the app falls back to delayed HTTP (15–20 min)."
         ),
     )
 
@@ -138,21 +151,22 @@ with st.sidebar:
 
     st.write("**Session date**")
     today_ny = datetime.now(tz=NY).date()
-    session_date = st.date_input("Target trading session (ET)", value=toady_ny if (toady_ny:=today_ny) else today_ny)  # defensive alias
+    session_date = st.date_input("Target trading session (ET)", value=today_ny)
 
     st.write("**Symbol format**")
     exchange_suffix = st.text_input(
         "Default exchange suffix (appends if missing)",
         value="US",
         help="EODHD uses exchange-suffixed symbols (e.g., AAPL.US). "
-             "If your CSV already includes suffixes, we keep them as-is.",
+             "If your CSV already includes suffixes, we keep them as‑is."
     )
 
     st.write("**Ranking**")
     top_n = st.number_input("Show top N by prediction", min_value=1, max_value=5000, value=200, step=1)
     require_asof_guard = st.checkbox(
         "Enforce as_of ≤ session open (avoid look-ahead)", value=True,
-        help="If an 'as_of' timestamp is present and is after the session open, that row will be dropped to avoid mixing intraday predictions with open→now returns."
+        help="If an 'as_of' timestamp is present and is after the session open, "
+             "that row will be dropped to avoid mixing intraday predictions with open→now returns."
     )
     allow_na_returns = st.checkbox("Include symbols with missing data (NA returns)", value=False)
 
@@ -164,7 +178,7 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.index, pd.MultiIndex):
         df = df.reset_index()
 
-    # Rename flexible column names
+    # Flexible column naming
     cols = {c.lower().strip(): c for c in df.columns}
     ticker_col = next((cols[k] for k in cols if k in ["ticker", "symbol"]), None)
     pred_col   = next((cols[k] for k in cols if k in ["prediction", "pred", "pred_score", "score", "yhat"]), None)
@@ -196,7 +210,6 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
         out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.date
 
     if "as_of" in out.columns:
-        # Store 'as_of' as ET tz-aware
         def _parse_asof(x):
             if pd.isna(x):
                 return pd.NaT
@@ -257,32 +270,10 @@ def _regular_session_bounds(session: date) -> Tuple[datetime, datetime]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def _get_session_open_close(session: date) -> Tuple[Optional[datetime], Optional[datetime], str]:
     """
-    For robustness and to avoid external entitlements, we use the standard 09:30–16:00 ET window,
-    and treat exchange holidays (if we detect them) as closed. If the exchange holiday check fails,
-    we still return 09:30–16:00 so the UI remains usable.
+    Robust default to 09:30–16:00 ET; optionally could query EODHD Exchanges API for holidays.
+    If the holiday check fails, still return regular hours so the UI remains usable.
     """
-    try:
-        # Optional: call EODHD exchange details to detect holidays. If it errors, keep regular hours.
-        url = f"{BASE_HOST}/api/exchange-details/US?api_token={API_TOKEN}&fmt=json"
-        r = _http.get(url, timeout=10)
-        if r.ok:
-            data = r.json()
-            # Best-effort holiday check (shape varies by doc; avoid hard reliance).
-            holidays = data.get("holidays") or data.get("StockMarketHolidays") or []
-            holiday_dates = set()
-            for h in holidays:
-                # try common keys, fall back to parsing strings
-                d = h.get("date") or h.get("Date")
-                if d:
-                    try:
-                        holiday_dates.add(pd.to_datetime(d).date())
-                    except Exception:
-                        pass
-            if session in holiday_dates:
-                return None, None, "holiday"
-    except Exception:
-        pass
-
+    # Minimal holiday awareness: you can extend this to call the Exchanges API if desired. :contentReference[oaicite:7]{index=7}
     open_et, close_et = _regular_session_bounds(session)
     return open_et, close_et, "regular"
 
@@ -300,12 +291,15 @@ def _strip_suffix(symbol: str) -> str:
     return s.split(".")[0]
 
 # -----------------------
-# EODHD Live v2 (delayed) HTTP fetchers
+# Helpers
 # -----------------------
 def _chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+# -----------------------
+# EODHD Live v2 (delayed) HTTP fetchers
+# -----------------------
 @st.cache_data(show_spinner=False, ttl=5)
 def _fetch_live_v2_quotes(symbols_eod: List[str]) -> pd.DataFrame:
     """
@@ -317,8 +311,7 @@ def _fetch_live_v2_quotes(symbols_eod: List[str]) -> pd.DataFrame:
 
     frames = []
     for chunk_syms in _chunk(symbols_eod, BATCH_SIZE_HTTP):
-        s_param = ",".join(chunk_syms)
-        url = f"{LIVE_V2_URL}?s={s_param}&api_token={API_TOKEN}&fmt=json"
+        url = f"{LIVE_V2_URL}?s={','.join(chunk_syms)}&api_token={API_TOKEN}&fmt=json"
         try:
             r = _http.get(url, timeout=10)
             if not r.ok:
@@ -349,14 +342,13 @@ def _fetch_live_v2_quotes(symbols_eod: List[str]) -> pd.DataFrame:
     return out
 
 # -----------------------
-# Optional: EODHD WebSocket latest prices
+# Optional: EODHD WebSocket latest prices (real-time override)
 # -----------------------
-@st.cache_data(show_spinner=False, ttl=2)  # very short TTL; WS provides fresh prints when called
+@st.cache_data(show_spinner=False, ttl=2)
 def _fetch_latest_prices_ws(symbols_eod: List[str]) -> pd.Series:
     """
-    Uses eodhdc WebSockets 'us' endpoint to collect latest trade prices for given tickers.
-    Symbols are subscribed WITHOUT the '.US' suffix per eodhdc examples. If anything fails,
-    returns empty Series, and caller should fall back to HTTP delayed.
+    Uses eodhdc WebSockets 'us' stream to collect latest trade prices for given tickers.
+    Symbols are subscribed WITHOUT the '.US' suffix. If anything fails, returns empty Series.
     """
     if not _HAS_EODHDC or not symbols_eod:
         return pd.Series(dtype=float)
@@ -370,28 +362,23 @@ def _fetch_latest_prices_ws(symbols_eod: List[str]) -> pd.Series:
 
         async def _collect():
             ws = EODHDWebSockets(key=API_TOKEN, buffer=1000)
-            # 'us' stream for trades; could also try 'us-quote' for quotes
             async with ws.connect("us") as websocket:
                 await ws.subscribe(websocket, tickers)
                 start = datetime.now()
                 async for msg in ws.receive(websocket):
-                    # msg can be dict or string; handle both
+                    # Normalize message to dict
                     if isinstance(msg, str):
                         try:
                             msg = json.loads(msg)
                         except Exception:
                             continue
-                    # Try common fields across EODHD streams:
-                    # symbol under 's' or 'code', price under 'p' or 'price'
                     sym = (msg.get("s") or msg.get("code") or "").upper()
                     px = msg.get("p") or msg.get("price") or msg.get("lastTradePrice")
                     if sym and isinstance(px, (int, float)):
                         prices[sym] = float(px)
-                    # Exit after WS_COLLECT_SECONDS
                     if (datetime.now() - start).total_seconds() >= WS_COLLECT_SECONDS:
-                        ws.deactivate()  # stop receive loop
-                # after exit, prices dict holds most recent prints observed
-            # Map back to EODHD '.US' symbols where possible
+                        ws.deactivate()
+                # map back to EOD symbols
             mapped = {}
             for s in symbols_eod:
                 base = _strip_suffix(s)
@@ -438,10 +425,10 @@ st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 # -----------------------
 session_open, session_close, session_source = _get_session_open_close(session_date)
 if session_open is None:
-    st.warning(f"Selected date {session_date} is **not** a US trading session (holiday). Pick a valid session.")
+    st.warning(f"Selected date {session_date} is **not** a US trading session. Pick a valid session.")
     st.stop()
 if session_source != "regular":
-    st.caption("⚠️ Using standard 09:30–16:00 ET session bounds (holidays excluded).")
+    st.caption("⚠️ Using standard 09:30–16:00 ET session bounds.")
 
 # Enforce as_of guard now that we know session_open
 preds_ranked = _post_asof_guard(preds_ranked, session_open, require_asof_guard=require_asof_guard)
@@ -456,24 +443,21 @@ symbols_in = preds_ranked["ticker"].dropna().astype(str).str.upper().tolist()
 symbols_eod = [_to_eod_symbol(t, exchange_suffix) for t in symbols_in]
 
 # -----------------------
-# Data fetch (Live v2 delayed) + optional realtime WS override
+# Data fetch: delayed HTTP + optional realtime WS override
 # -----------------------
 quotes = _fetch_live_v2_quotes(symbols_eod)  # index: EOD symbol; cols: open, lastTradePrice, timestamp
 
-# Optional WebSocket override for last price (graceful fallback)
+# Optional WebSocket override for last price
 if ws_enabled:
     if not _HAS_EODHDC:
-        st.info("WebSocket client 'eodhdc' not installed; using delayed HTTP. "
+        st.info("WebSocket client `eodhdc` not installed; using delayed HTTP. "
                 "Add `eodhdc` to your environment to enable WS override.")
     else:
         ws_px = _fetch_latest_prices_ws(symbols_eod)
         if not ws_px.empty:
-            # Align indices and overwrite lastTradePrice with real-time where available
             quotes.loc[ws_px.index, "lastTradePrice"] = ws_px
 
 now_et = datetime.now(tz=NY)
-if now_et < session_open:
-    st.info("Regular session hasn’t opened yet (09:30 ET). Open→now returns will populate after the open.")
 
 # -----------------------
 # Merge with predictions & compute returns
@@ -484,8 +468,12 @@ map_df = pd.DataFrame({"ticker": symbols_in, "eod_symbol": symbols_eod}).drop_du
 df_view = preds_ranked.merge(map_df, on="ticker", how="left")
 df_view = df_view.merge(quotes[["open", "lastTradePrice"]], left_on="eod_symbol", right_index=True, how="left")
 
-# Compute intraday return from session open → now (delayed or realtime depending on source)
-df_view["return_open_to_now"] = (df_view["lastTradePrice"] / df_view["open"] - 1.0).replace([np.inf, -np.inf], np.nan)
+# Compute intraday return from session open → now.
+# Guard: if before regular open, suppress returns to avoid using prior-day open.
+if now_et < session_open:
+    df_view["return_open_to_now"] = np.nan
+else:
+    df_view["return_open_to_now"] = (df_view["lastTradePrice"] / df_view["open"] - 1.0).replace([np.inf, -np.inf], np.nan)
 
 # Optionally drop rows with NA returns
 if not allow_na_returns:

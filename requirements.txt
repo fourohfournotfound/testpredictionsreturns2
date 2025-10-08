@@ -1,1 +1,6 @@
-streamlit
+pandas
+numpy
+pytz
+python-dateutil
+alpaca-py
+streamlit-autorefresh

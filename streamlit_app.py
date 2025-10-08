@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import os
 import io
-from datetime import datetime, date
-from typing import List, Dict, Tuple
+from datetime import datetime, date, time
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -59,7 +59,7 @@ from alpaca.trading.requests import GetCalendarRequest
 st.set_page_config(page_title="Live LTR Monitor (Alpaca)", layout="wide")
 
 NY = pytz.timezone("America/New_York")
-BATCH_SIZE = 200  # conservative batch size for any API request loops
+BATCH_SIZE = 200  # conservative batch size for API request loops
 
 # -----------------------
 # Secrets / env & helpers
@@ -80,7 +80,7 @@ if API_KEY:    os.environ["APCA_API_KEY_ID"] = API_KEY
 if API_SECRET: os.environ["APCA_API_SECRET_KEY"] = API_SECRET
 if BASE_URL:   os.environ["APCA_API_BASE_URL"] = BASE_URL
 
-# Common default CSV locations (Cloud upload mounts sometimes use /mnt/data)
+# Common default CSV locations
 DEFAULT_PREDICTIONS_PATHS = [
     os.environ.get("PREDICTIONS_CSV", "").strip() or "",
     "live_predictions.csv",
@@ -121,15 +121,29 @@ with st.sidebar.expander("🔍 Secrets debug"):
 # -----------------------
 # Clients as cached resources (best practice)
 # -----------------------
+def _infer_is_paper(base_url: Optional[str]) -> bool:
+    """
+    Default to paper when no BASE_URL is provided.
+    If a BASE_URL is provided, consider it paper only if it contains 'paper-api'.
+    """
+    if not base_url:
+        return True  # safer default during dev
+    return "paper-api" in base_url
+
 @st.cache_resource(show_spinner=False)
-def _init_clients(api_key: str, api_secret: str, base_url: str | None) -> Tuple[StockHistoricalDataClient, TradingClient]:
+def _init_clients(api_key: str, api_secret: str, base_url: Optional[str]) -> Tuple[StockHistoricalDataClient, TradingClient]:
     """Initialize Alpaca clients once per session/process.
 
     cache_resource is appropriate for SDK clients (unhashable, stateful).
     """
     data_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
-    is_paper = bool(base_url) and ("paper-api" in base_url)
-    trading_client = TradingClient(api_key, api_secret, paper=is_paper)
+    trading_client = TradingClient(
+        api_key,
+        api_secret,
+        paper=_infer_is_paper(base_url),
+        # url_override lets us honor APCA_API_BASE_URL explicitly when set (paper or live).
+        url_override=base_url if base_url else None
+    )  # :contentReference[oaicite:5]{index=5}
     return data_client, trading_client
 
 # Instantiate resources early so downstream cached functions can reference them
@@ -160,7 +174,6 @@ with st.sidebar:
     st.write("**Predictions file**")
     file_src = st.radio("Load from…", ["Local path", "Upload"])
     if file_src == "Local path":
-        # choose first existing default as convenience
         default_guess = next((p for p in DEFAULT_PREDICTIONS_PATHS if p and os.path.exists(p)), DEFAULT_PREDICTIONS_PATHS[0] or "live_predictions.csv")
         preds_path = st.text_input("Path to CSV", value=default_guess, help="e.g., ./live_predictions.csv or /mnt/data/live_predictions.csv")
         upload_file = None
@@ -269,20 +282,36 @@ def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guar
     return out
 
 # -----------------------
-# Market calendar (cache_data keyed only by primitives)
+# Calendar utilities
 # -----------------------
+def _regular_session_bounds(session: date) -> Tuple[datetime, datetime]:
+    """Fallback: 09:30–16:00 ET for the given date."""
+    return (
+        NY.localize(datetime.combine(session, time(9, 30))),
+        NY.localize(datetime.combine(session, time(16, 0))),
+    )
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def _get_session_open_close(session: date) -> tuple[datetime | None, datetime | None]:
-    """Fetch the regular session open/close for the given date (ET)."""
-    req = GetCalendarRequest(start=session, end=session)
-    cal = trading_client.get_calendar(req)
-    if not cal:
-        return None, None
-    c = cal[0]
-    # Calendar.open/close are datetimes; ensure ET
-    session_open = (c.open if c.open.tzinfo else NY.localize(c.open)).astimezone(NY)
-    session_close = (c.close if c.close.tzinfo else NY.localize(c.close)).astimezone(NY)
-    return session_open, session_close
+def _get_session_open_close(session: date) -> Tuple[Optional[datetime], Optional[datetime], str]:
+    """
+    Use Alpaca's Trading API calendar for the exact open/close (handles early closes).
+    If the call fails due to APIError, fall back to 09:30–16:00 ET so the app keeps working.
+    """
+    try:
+        req = GetCalendarRequest(start=session, end=session)  # start/end accept `date` objects
+        cal = trading_client.get_calendar(req)  # list[Calendar]
+        # Calendar model has: date, open: datetime, close: datetime (ET)  :contentReference[oaicite:6]{index=6}
+        if not cal:
+            return None, None, "not_session"
+        c = cal[0]
+        open_et = c.open if c.open.tzinfo else NY.localize(c.open)
+        close_et = c.close if c.close.tzinfo else NY.localize(c.close)
+        return open_et.astimezone(NY), close_et.astimezone(NY), "alpaca_trading_calendar"
+    except Exception as e:
+        # Fallback keeps UI functional; annotate so users know early closes aren't reflected
+        open_et, close_et = _regular_session_bounds(session)
+        st.warning("Calendar API unavailable; falling back to regular session 09:30–16:00 ET for this date.")
+        return open_et, close_et, "fallback_regular"
 
 # -----------------------
 # Data fetchers (cache_data with TTL; never pass client objects)
@@ -302,7 +331,7 @@ def _fetch_open_prices(
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Minute,
-        start=session_open,  # tz-aware ET; SDK treats tz-naive as UTC
+        start=session_open,  # tz-aware ET; tz-naive inputs are treated as UTC by Alpaca  :contentReference[oaicite:7]{index=7}
         end=min(datetime.now(tz=NY), session_close),
         feed=feed,
         adjustment=Adjustment.SPLIT,
@@ -310,7 +339,7 @@ def _fetch_open_prices(
 
     try:
         bars = data_client.get_stock_bars(req)
-        df = bars.df  # MultiIndex: (symbol, timestamp)
+        df = bars.df  # MultiIndex: (symbol, timestamp). Returned timestamps are UTC in .df.  :contentReference[oaicite:8]{index=8}
     except Exception as e:
         st.error(f"Failed to fetch open prices: {e}")
         return pd.Series(dtype=float)
@@ -344,7 +373,6 @@ def _fetch_latest_prices(
             latest = data_client.get_stock_latest_trade(req)  # dict: symbol -> Trade
             for sym, trade in (latest or {}).items():
                 try:
-                    # Trade model exposes a 'price' attribute
                     prices[sym] = float(trade.price)
                 except Exception:
                     continue
@@ -362,7 +390,6 @@ def _fetch_latest_prices(
 if 'upload_file' in locals() and upload_file is not None:
     preds = _load_predictions_from_upload(upload_file)
 else:
-    # Try a sensible default path if user didn't upload
     chosen_default = preds_path
     if not chosen_default:
         chosen_default = next((p for p in DEFAULT_PREDICTIONS_PATHS if p and os.path.exists(p)), "live_predictions.csv")
@@ -390,10 +417,12 @@ st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 # -----------------------
 # Market times
 # -----------------------
-session_open, session_close = _get_session_open_close(session_date)
+session_open, session_close, session_source = _get_session_open_close(session_date)
 if session_open is None:
     st.warning(f"Selected date {session_date} is **not** a US trading session. Pick a valid session.")
     st.stop()
+if session_source == "fallback_regular":
+    st.caption("⚠️ Using fallback 09:30–16:00 ET session bounds (Alpaca calendar unavailable). Early closes not reflected.")
 
 # Enforce as_of guard now that we know session_open
 preds_ranked = _post_asof_guard(preds_ranked, session_open, require_asof_guard=require_asof_guard)

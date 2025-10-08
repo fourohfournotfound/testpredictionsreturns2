@@ -1,14 +1,13 @@
 # Core
-streamlit
-streamlit-autorefresh
-requests
-python-dateutil
-pytz
+streamlit==1.38.0
+streamlit-autorefresh==1.0.1
+requests==2.32.3
+python-dateutil==2.9.0.post0
+pytz==2024.1
 
-# ABI-compatible pair (avoids pandas/_libs ValueError on Cloud)
+# Pin an ABI-compatible pair to avoid pandas/_libs import crashes
 numpy==2.0.2
 pandas==2.2.2
-# pandas 2.2.2 is the first release broadly compatible with NumPy 2.0.x. :contentReference[oaicite:8]{index=8}
 
-# Optional real-time WebSockets override
-eodhdc>=1.1.0  # official Python client for EODHD REST/WS. :contentReference[oaicite:9]{index=9}
+# Optional real-time WebSockets override for EODHD
+eodhdc==1.1.0

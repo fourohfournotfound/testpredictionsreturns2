@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 import io
 from datetime import datetime, date
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -53,26 +53,17 @@ from alpaca.data.enums import DataFeed, Adjustment
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetCalendarRequest
 
-with st.sidebar.expander("🔍 Secrets debug"):
-    import os, streamlit as st
-    try:
-        st.write("Top-level keys:", list(st.secrets.keys()))
-        st.write("Has APCA_API_KEY_ID?", "APCA_API_KEY_ID" in st.secrets)
-        st.write("Has [alpaca] table?", "alpaca" in st.secrets)
-        if "alpaca" in st.secrets:
-            st.write("Keys in [alpaca]:", list(st.secrets["alpaca"].keys()))
-    except Exception as e:
-        st.write("st.secrets unavailable:", repr(e))
-        st.write("env APCA_API_KEY_ID present?", bool(os.environ.get("APCA_API_KEY_ID")))
-
 # -----------------------
-# Config & constants
+# Page config
 # -----------------------
 st.set_page_config(page_title="Live LTR Monitor (Alpaca)", layout="wide")
 
 NY = pytz.timezone("America/New_York")
+BATCH_SIZE = 200  # conservative batch size for any API request loops
 
-# ---- Secrets + env (Community Cloud uses st.secrets; local dev can use env)
+# -----------------------
+# Secrets / env & helpers
+# -----------------------
 def _get_secret(name, default=None, table=None):
     try:
         return (st.secrets[table][name] if table else st.secrets[name])
@@ -84,66 +75,21 @@ API_SECRET = _get_secret("APCA_API_SECRET_KEY") or _get_secret("APCA_API_SECRET_
 DATA_FEED_ENV = (_get_secret("APCA_DATA_FEED") or _get_secret("APCA_DATA_FEED", table="alpaca") or "IEX").upper()
 BASE_URL   = _get_secret("APCA_API_BASE_URL") or _get_secret("APCA_API_BASE_URL", table="alpaca")
 
-# (optional) mirror to env for any libs that auto-read environment variables
+# (optional) mirror to env in case libs auto-read environment variables
 if API_KEY:    os.environ["APCA_API_KEY_ID"] = API_KEY
 if API_SECRET: os.environ["APCA_API_SECRET_KEY"] = API_SECRET
 if BASE_URL:   os.environ["APCA_API_BASE_URL"] = BASE_URL
 
-DEFAULT_PREDICTIONS_PATH = os.environ.get("PREDICTIONS_CSV", "live_predictions.csv")
+# Common default CSV locations (Cloud upload mounts sometimes use /mnt/data)
+DEFAULT_PREDICTIONS_PATHS = [
+    os.environ.get("PREDICTIONS_CSV", "").strip() or "",
+    "live_predictions.csv",
+    "/mnt/data/live_predictions.csv",
+]
+
 FEED_MAP = {"IEX": DataFeed.IEX, "SIP": DataFeed.SIP, "DELAYED_SIP": DataFeed.DELAYED_SIP}
 DEFAULT_FEED = FEED_MAP.get(DATA_FEED_ENV, DataFeed.IEX)
 
-# Conservative batch size to avoid any request-size or rate issues
-BATCH_SIZE = 200
-
-# -----------------------
-# UI - Sidebar controls
-# -----------------------
-with st.sidebar:
-    st.title("⚙️ Settings")
-
-    # Small sanity banner so it's obvious if keys were seen
-    st.caption(f"🔐 Alpaca key loaded: {'yes' if bool(API_KEY) else 'no'} | feed default={DATA_FEED_ENV}")
-
-    st.write("**Alpaca Data Feed**")
-    chosen_feed = st.selectbox(
-        "Feed (IEX=single-venue realtime; SIP=consolidated realtime*)",
-        options=["IEX", "SIP", "DELAYED_SIP"],
-        index=["IEX", "SIP", "DELAYED_SIP"].index(DATA_FEED_ENV if DATA_FEED_ENV in ["IEX","SIP","DELAYED_SIP"] else "IEX"),
-        help="Pick SIP if your subscription includes it; otherwise IEX is realtime from a single exchange. DELAYED_SIP is a 15-minute delayed consolidated feed."
-    )
-    DATA_FEED = FEED_MAP[chosen_feed]
-
-    st.write("**Auto refresh**")
-    refresh_sec = st.slider("Refresh interval (seconds)", min_value=5, max_value=120, value=10, step=5)
-    _ = st_autorefresh(interval=refresh_sec * 1000, key="autorefresh")
-
-    st.write("**Predictions file**")
-    file_src = st.radio("Load from…", ["Local path", "Upload"])
-    if file_src == "Local path":
-        preds_path = st.text_input("Path to CSV", value=DEFAULT_PREDICTIONS_PATH, help="e.g., ./live_predictions.csv")
-        upload_file = None
-    else:
-        upload_file = st.file_uploader("Upload CSV", type=["csv"])
-        preds_path = None
-
-    st.write("**Session date**")
-    # Default to "today in New York"
-    today_ny = datetime.now(tz=NY).date()
-    session_date = st.date_input("Target trading session (ET)", value=today_ny)
-
-    st.write("**Ranking**")
-    top_n = st.number_input("Show top N by prediction", min_value=1, max_value=5000, value=200, step=1)
-    require_asof_guard = st.checkbox(
-        "Enforce as_of ≥ session open (avoid look-ahead)", value=True,
-        help="If an 'as_of' timestamp is present and is before the session open, we’ll still use session open. "
-             "If it's after session open, we’ll drop that row so you don’t mix intraday predictions with open-to-now returns."
-    )
-    allow_na_returns = st.checkbox("Include symbols with missing data (NA returns)", value=False)
-
-# -----------------------
-# Helpers
-# -----------------------
 def _ensure_api_keys() -> None:
     missing = []
     if not API_KEY:
@@ -158,15 +104,85 @@ def _ensure_api_keys() -> None:
         )
         st.stop()
 
-@st.cache_data(show_spinner=False)
-def _init_clients(api_key: str, api_secret: str, base_url: str | None):
-    # Market data client (REST)
-    data_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)  # creds passed explicitly
-    # Trading client (for calendar/clock)
+# -----------------------
+# Debug panel (optional)
+# -----------------------
+with st.sidebar.expander("🔍 Secrets debug"):
+    try:
+        st.write("Top-level keys:", list(st.secrets.keys()))
+        st.write("Has APCA_API_KEY_ID?", "APCA_API_KEY_ID" in st.secrets)
+        st.write("Has [alpaca] table?", "alpaca" in st.secrets)
+        if "alpaca" in st.secrets:
+            st.write("Keys in [alpaca]:", list(st.secrets["alpaca"].keys()))
+    except Exception as e:
+        st.write("st.secrets unavailable:", repr(e))
+        st.write("env APCA_API_KEY_ID present?", bool(os.environ.get("APCA_API_KEY_ID")))
+
+# -----------------------
+# Clients as cached resources (best practice)
+# -----------------------
+@st.cache_resource(show_spinner=False)
+def _init_clients(api_key: str, api_secret: str, base_url: str | None) -> Tuple[StockHistoricalDataClient, TradingClient]:
+    """Initialize Alpaca clients once per session/process.
+
+    cache_resource is appropriate for SDK clients (unhashable, stateful).
+    """
+    data_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
     is_paper = bool(base_url) and ("paper-api" in base_url)
     trading_client = TradingClient(api_key, api_secret, paper=is_paper)
     return data_client, trading_client
 
+# Instantiate resources early so downstream cached functions can reference them
+_ensure_api_keys()
+data_client, trading_client = _init_clients(API_KEY, API_SECRET, BASE_URL)
+
+# -----------------------
+# Sidebar UI
+# -----------------------
+with st.sidebar:
+    st.title("⚙️ Settings")
+
+    st.caption(f"🔐 Alpaca key loaded: {'yes' if bool(API_KEY) else 'no'} | feed default={DATA_FEED_ENV}")
+
+    st.write("**Alpaca Data Feed**")
+    chosen_feed = st.selectbox(
+        "Feed (IEX=single-venue realtime; SIP=consolidated realtime; DELAYED_SIP=15-min delay)",
+        options=["IEX", "SIP", "DELAYED_SIP"],
+        index=["IEX", "SIP", "DELAYED_SIP"].index(DATA_FEED_ENV if DATA_FEED_ENV in ["IEX","SIP","DELAYED_SIP"] else "IEX"),
+        help="Pick SIP if your subscription includes it; DELAYED_SIP is 15-min delayed consolidated tape."
+    )
+    DATA_FEED = FEED_MAP[chosen_feed]
+
+    st.write("**Auto refresh**")
+    refresh_sec = st.slider("Refresh interval (seconds)", min_value=5, max_value=120, value=10, step=5)
+    _ = st_autorefresh(interval=refresh_sec * 1000, key="autorefresh")
+
+    st.write("**Predictions file**")
+    file_src = st.radio("Load from…", ["Local path", "Upload"])
+    if file_src == "Local path":
+        # choose first existing default as convenience
+        default_guess = next((p for p in DEFAULT_PREDICTIONS_PATHS if p and os.path.exists(p)), DEFAULT_PREDICTIONS_PATHS[0] or "live_predictions.csv")
+        preds_path = st.text_input("Path to CSV", value=default_guess, help="e.g., ./live_predictions.csv or /mnt/data/live_predictions.csv")
+        upload_file = None
+    else:
+        upload_file = st.file_uploader("Upload CSV", type=["csv"])
+        preds_path = None
+
+    st.write("**Session date**")
+    today_ny = datetime.now(tz=NY).date()
+    session_date = st.date_input("Target trading session (ET)", value=today_ny)
+
+    st.write("**Ranking**")
+    top_n = st.number_input("Show top N by prediction", min_value=1, max_value=5000, value=200, step=1)
+    require_asof_guard = st.checkbox(
+        "Enforce as_of ≤ session open (avoid look-ahead)", value=True,
+        help="If an 'as_of' timestamp is present and is after the session open, that row will be dropped to avoid mixing intraday predictions with open→now returns."
+    )
+    allow_na_returns = st.checkbox("Include symbols with missing data (NA returns)", value=False)
+
+# -----------------------
+# Data loaders / normalizers (cache_data with hashable args only)
+# -----------------------
 def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     # Reset MultiIndex if needed
     if isinstance(df.index, pd.MultiIndex):
@@ -235,37 +251,58 @@ def _load_predictions_from_upload(upload: io.BytesIO) -> pd.DataFrame:
     df = pd.read_csv(upload)
     return _normalize_predictions(df)
 
-@st.cache_data(show_spinner=False)
-def _get_session_open_close(trading_client: TradingClient, session: date) -> tuple[datetime | None, datetime | None]:
-    # Use Alpaca calendar which includes early closes
+def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFrame:
+    out = df.copy()
+    if "date" in out.columns:
+        before_shape = out.shape
+        out = out[out["date"] == session]
+        st.caption(f"📐 After filtering to session={session} (by 'date'): {before_shape} → {out.shape}")
+    return out
+
+def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guard: bool) -> pd.DataFrame:
+    out = df.copy()
+    if require_asof_guard and "as_of" in out.columns:
+        mask_ok = df["as_of"].isna() | (df["as_of"] <= session_open)
+        before = out.shape
+        out = out[mask_ok]
+        st.caption(f"📐 After enforcing as_of ≤ session_open (no look-ahead): {before} → {out.shape}")
+    return out
+
+# -----------------------
+# Market calendar (cache_data keyed only by primitives)
+# -----------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def _get_session_open_close(session: date) -> tuple[datetime | None, datetime | None]:
+    """Fetch the regular session open/close for the given date (ET)."""
     req = GetCalendarRequest(start=session, end=session)
     cal = trading_client.get_calendar(req)
     if not cal:
         return None, None
     c = cal[0]
-    session_open = dateparser.parse(c.open).astimezone(NY)
-    session_close = dateparser.parse(c.close).astimezone(NY)
+    # Calendar.open/close are datetimes; ensure ET
+    session_open = (c.open if c.open.tzinfo else NY.localize(c.open)).astimezone(NY)
+    session_close = (c.close if c.close.tzinfo else NY.localize(c.close)).astimezone(NY)
     return session_open, session_close
 
-def _chunk(lst: List[str], n: int) -> List[List[str]]:
-    return [lst[i:i+n] for i in range(0, len(lst), n)]
-
-@st.cache_data(show_spinner=False)
+# -----------------------
+# Data fetchers (cache_data with TTL; never pass client objects)
+# -----------------------
+@st.cache_data(show_spinner=False, ttl=300)
 def _fetch_open_prices(
-    data_client: StockHistoricalDataClient,
     symbols: List[str],
     session_open: datetime,
     session_close: datetime,
-    feed: DataFeed
+    feed_name: str
 ) -> pd.Series:
     """Return a Series indexed by symbol with the first minute bar 'open' at/after session_open."""
     if not symbols:
         return pd.Series(dtype=float)
+    feed = FEED_MAP[feed_name]
 
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Minute,
-        start=session_open,
+        start=session_open,  # tz-aware ET; SDK treats tz-naive as UTC
         end=min(datetime.now(tz=NY), session_close),
         feed=feed,
         adjustment=Adjustment.SPLIT,
@@ -289,23 +326,25 @@ def _fetch_open_prices(
     first_open.name = "open_today"
     return first_open
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=5)
 def _fetch_latest_prices(
-    data_client: StockHistoricalDataClient,
     symbols: List[str],
-    feed: DataFeed
+    feed_name: str
 ) -> pd.Series:
     """Return a Series indexed by symbol with the latest trade price."""
     if not symbols:
         return pd.Series(dtype=float)
+    feed = FEED_MAP[feed_name]
 
     prices: Dict[str, float] = {}
     try:
-        for chunk in _chunk(symbols, BATCH_SIZE):
+        for i in range(0, len(symbols), BATCH_SIZE):
+            chunk = symbols[i : i + BATCH_SIZE]
             req = StockLatestTradeRequest(symbol_or_symbols=chunk, feed=feed)
             latest = data_client.get_stock_latest_trade(req)  # dict: symbol -> Trade
             for sym, trade in (latest or {}).items():
                 try:
+                    # Trade model exposes a 'price' attribute
                     prices[sym] = float(trade.price)
                 except Exception:
                     continue
@@ -317,33 +356,18 @@ def _fetch_latest_prices(
     s.name = "last_price"
     return s
 
-def _align_and_filter_for_session(df: pd.DataFrame, session: date, require_asof_guard: bool) -> pd.DataFrame:
-    out = df.copy()
-    if "date" in out.columns:
-        before_shape = out.shape
-        out = out[out["date"] == session]
-        st.caption(f"📐 After filtering to session={session} (by 'date'): {before_shape} → {out.shape}")
-    # as_of guard applied later once we know open time
-    return out
-
-def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guard: bool) -> pd.DataFrame:
-    out = df.copy()
-    if require_asof_guard and "as_of" in out.columns:
-        mask_ok = df["as_of"].isna() | (df["as_of"] <= session_open)
-        before = out.shape
-        out = out[mask_ok]
-        st.caption(f"📐 After enforcing as_of ≤ session_open (no look-ahead): {before} → {out.shape}")
-    return out
-
 # -----------------------
 # Load predictions
 # -----------------------
 if 'upload_file' in locals() and upload_file is not None:
     preds = _load_predictions_from_upload(upload_file)
 else:
-    # If the path doesn’t exist, still let the app run so the user can upload
-    if 'preds_path' in locals() and preds_path and os.path.exists(preds_path):
-        preds = _load_predictions_from_path(preds_path)
+    # Try a sensible default path if user didn't upload
+    chosen_default = preds_path
+    if not chosen_default:
+        chosen_default = next((p for p in DEFAULT_PREDICTIONS_PATHS if p and os.path.exists(p)), "live_predictions.csv")
+    if chosen_default and os.path.exists(chosen_default):
+        preds = _load_predictions_from_path(chosen_default)
     else:
         preds = pd.DataFrame(columns=["ticker", "prediction"])
 
@@ -352,10 +376,10 @@ if preds.empty:
             "`ticker`, `prediction`, optional `date`, optional `as_of`.")
     st.stop()
 
-# Filter to target session & enforce guard later
-preds = _align_and_filter_for_session(preds, session_date, require_asof_guard=require_asof_guard)
+# Filter to target session
+preds = _align_and_filter_for_session(preds, session_date)
 
-# Rank by prediction
+# Rank by prediction (descending)
 preds_ranked = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
 preds_ranked["rank"] = np.arange(1, len(preds_ranked) + 1)
 
@@ -366,14 +390,12 @@ st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 # -----------------------
 # Market times
 # -----------------------
-_ensure_api_keys()
-data_client, trading_client = _init_clients(API_KEY, API_SECRET, BASE_URL)
-session_open, session_close = _get_session_open_close(trading_client, session_date)
+session_open, session_close = _get_session_open_close(session_date)
 if session_open is None:
     st.warning(f"Selected date {session_date} is **not** a US trading session. Pick a valid session.")
     st.stop()
 
-# Now that we have session_open, enforce as_of guard if needed
+# Enforce as_of guard now that we know session_open
 preds_ranked = _post_asof_guard(preds_ranked, session_open, require_asof_guard=require_asof_guard)
 
 if preds_ranked.empty:
@@ -386,8 +408,8 @@ symbols = preds_ranked["ticker"].dropna().astype(str).str.upper().unique().tolis
 # -----------------------
 # Data fetch: open price and latest price
 # -----------------------
-open_px = _fetch_open_prices(data_client, symbols, session_open, session_close, feed=DATA_FEED)
-last_px = _fetch_latest_prices(data_client, symbols, feed=DATA_FEED)
+open_px = _fetch_open_prices(symbols, session_open, session_close, feed_name=chosen_feed)
+last_px = _fetch_latest_prices(symbols, feed_name=chosen_feed)
 
 # Merge with predictions
 df_view = preds_ranked.merge(open_px.rename("open_today"), left_on="ticker", right_index=True, how="left")

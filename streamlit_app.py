@@ -19,8 +19,7 @@
 # Notes:
 # - "Open" means *regular trading session open* (09:30 America/New_York) per the market calendar.
 # - Feed selection is honored for both historical bars and latest trades.
-# - If you only have the free plan, recent historical data may be delayed (15 min). Use IEX (realtime from a single venue)
-#   or upgrade for SIP if you need consolidated realtime. The app exposes this in the sidebar.
+# - If you only have the free plan, SIP may not be available; we will auto-fallback to IEX or DELAYED_SIP.
 #
 # Safety:
 # - We never place orders; this is read-only market data for monitoring predictions/returns.
@@ -30,7 +29,7 @@ from __future__ import annotations
 
 import os
 import io
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -59,7 +58,8 @@ from alpaca.trading.requests import GetCalendarRequest
 st.set_page_config(page_title="Live LTR Monitor (Alpaca)", layout="wide")
 
 NY = pytz.timezone("America/New_York")
-BATCH_SIZE = 200  # conservative batch size for API request loops
+BATCH_SIZE = 200  # conservative batch size for market data requests
+OPEN_LOOKAHEAD_MIN = 5  # only fetch first 5 minutes after 09:30 for open price
 
 # -----------------------
 # Secrets / env & helpers
@@ -122,28 +122,21 @@ with st.sidebar.expander("🔍 Secrets debug"):
 # Clients as cached resources (best practice)
 # -----------------------
 def _infer_is_paper(base_url: Optional[str]) -> bool:
-    """
-    Default to paper when no BASE_URL is provided.
-    If a BASE_URL is provided, consider it paper only if it contains 'paper-api'.
-    """
+    """Default to paper when no BASE_URL is provided; else treat 'paper-api' host as paper."""
     if not base_url:
-        return True  # safer default during dev
+        return True
     return "paper-api" in base_url
 
 @st.cache_resource(show_spinner=False)
 def _init_clients(api_key: str, api_secret: str, base_url: Optional[str]) -> Tuple[StockHistoricalDataClient, TradingClient]:
-    """Initialize Alpaca clients once per session/process.
-
-    cache_resource is appropriate for SDK clients (unhashable, stateful).
-    """
+    """Initialize Alpaca clients once per session/process."""
     data_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
     trading_client = TradingClient(
         api_key,
         api_secret,
         paper=_infer_is_paper(base_url),
-        # url_override lets us honor APCA_API_BASE_URL explicitly when set (paper or live).
         url_override=base_url if base_url else None
-    )  # :contentReference[oaicite:5]{index=5}
+    )
     return data_client, trading_client
 
 # Instantiate resources early so downstream cached functions can reference them
@@ -165,7 +158,6 @@ with st.sidebar:
         index=["IEX", "SIP", "DELAYED_SIP"].index(DATA_FEED_ENV if DATA_FEED_ENV in ["IEX","SIP","DELAYED_SIP"] else "IEX"),
         help="Pick SIP if your subscription includes it; DELAYED_SIP is 15-min delayed consolidated tape."
     )
-    DATA_FEED = FEED_MAP[chosen_feed]
 
     st.write("**Auto refresh**")
     refresh_sec = st.slider("Refresh interval (seconds)", min_value=5, max_value=120, value=10, step=5)
@@ -295,23 +287,55 @@ def _regular_session_bounds(session: date) -> Tuple[datetime, datetime]:
 def _get_session_open_close(session: date) -> Tuple[Optional[datetime], Optional[datetime], str]:
     """
     Use Alpaca's Trading API calendar for the exact open/close (handles early closes).
-    If the call fails due to APIError, fall back to 09:30–16:00 ET so the app keeps working.
+    If the call fails, fall back to 09:30–16:00 ET so the app keeps working.
     """
     try:
-        req = GetCalendarRequest(start=session, end=session)  # start/end accept `date` objects
-        cal = trading_client.get_calendar(req)  # list[Calendar]
-        # Calendar model has: date, open: datetime, close: datetime (ET)  :contentReference[oaicite:6]{index=6}
+        req = GetCalendarRequest(start=session, end=session)
+        cal = trading_client.get_calendar(req)
         if not cal:
             return None, None, "not_session"
         c = cal[0]
         open_et = c.open if c.open.tzinfo else NY.localize(c.open)
         close_et = c.close if c.close.tzinfo else NY.localize(c.close)
         return open_et.astimezone(NY), close_et.astimezone(NY), "alpaca_trading_calendar"
-    except Exception as e:
-        # Fallback keeps UI functional; annotate so users know early closes aren't reflected
+    except Exception:
         open_et, close_et = _regular_session_bounds(session)
         st.warning("Calendar API unavailable; falling back to regular session 09:30–16:00 ET for this date.")
         return open_et, close_et, "fallback_regular"
+
+# -----------------------
+# Feed probing & fallback
+# -----------------------
+def _is_auth_or_perm_error(err: Exception) -> bool:
+    s = str(err).lower()
+    # Common signals: 401/403, 'unauthorized', 'forbidden', 'subscription', 'not permit', nginx auth
+    return any(k in s for k in ["401", "403", "unauthorized", "forbidden", "subscription", "not permit", "authorization required"])
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _resolve_effective_feed(preferred_feed: str) -> Tuple[str, str]:
+    """
+    Probe the preferred feed with a tiny request. If unauthorized or not entitled,
+    fall back to IEX, then to DELAYED_SIP. Returns (feed_used, reason).
+    """
+    test_symbol = "AAPL"
+    order = [preferred_feed, "IEX", "DELAYED_SIP"]
+    tried = []
+    for name in order:
+        if name in tried:
+            continue
+        tried.append(name)
+        try:
+            req = StockLatestTradeRequest(symbol_or_symbols=[test_symbol], feed=FEED_MAP[name])
+            _ = data_client.get_stock_latest_trade(req)  # dict
+            return name, "ok" if name == preferred_feed else f"fallback_from_{preferred_feed}"
+        except Exception as e:
+            if _is_auth_or_perm_error(e):
+                continue  # try next
+            else:
+                # Non-auth error: still try next, but annotate
+                continue
+    # If none worked, default to IEX to avoid None
+    return "IEX", "forced_iex"
 
 # -----------------------
 # Data fetchers (cache_data with TTL; never pass client objects)
@@ -326,22 +350,27 @@ def _fetch_open_prices(
     """Return a Series indexed by symbol with the first minute bar 'open' at/after session_open."""
     if not symbols:
         return pd.Series(dtype=float)
-    feed = FEED_MAP[feed_name]
 
+    now_et = datetime.now(tz=NY)
+    if now_et < session_open:
+        # too early; no regular-session bars exist yet
+        return pd.Series(dtype=float)
+
+    end_for_open = min(session_open + timedelta(minutes=OPEN_LOOKAHEAD_MIN), now_et, session_close)
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Minute,
-        start=session_open,  # tz-aware ET; tz-naive inputs are treated as UTC by Alpaca  :contentReference[oaicite:7]{index=7}
-        end=min(datetime.now(tz=NY), session_close),
-        feed=feed,
+        start=session_open,
+        end=end_for_open,
+        feed=FEED_MAP[feed_name],
         adjustment=Adjustment.SPLIT,
     )
 
     try:
         bars = data_client.get_stock_bars(req)
-        df = bars.df  # MultiIndex: (symbol, timestamp). Returned timestamps are UTC in .df.  :contentReference[oaicite:8]{index=8}
+        df = bars.df  # MultiIndex: (symbol, timestamp)
     except Exception as e:
-        st.error(f"Failed to fetch open prices: {e}")
+        st.error(f"Failed to fetch open prices ({feed_name}): {e}")
         return pd.Series(dtype=float)
 
     if df is None or df.empty:
@@ -363,13 +392,12 @@ def _fetch_latest_prices(
     """Return a Series indexed by symbol with the latest trade price."""
     if not symbols:
         return pd.Series(dtype=float)
-    feed = FEED_MAP[feed_name]
 
     prices: Dict[str, float] = {}
     try:
         for i in range(0, len(symbols), BATCH_SIZE):
             chunk = symbols[i : i + BATCH_SIZE]
-            req = StockLatestTradeRequest(symbol_or_symbols=chunk, feed=feed)
+            req = StockLatestTradeRequest(symbol_or_symbols=chunk, feed=FEED_MAP[feed_name])
             latest = data_client.get_stock_latest_trade(req)  # dict: symbol -> Trade
             for sym, trade in (latest or {}).items():
                 try:
@@ -377,7 +405,7 @@ def _fetch_latest_prices(
                 except Exception:
                     continue
     except Exception as e:
-        st.error(f"Failed to fetch latest prices: {e}")
+        st.error(f"Failed to fetch latest prices ({feed_name}): {e}")
         return pd.Series(dtype=float)
 
     s = pd.Series(prices, dtype=float)
@@ -435,10 +463,23 @@ if preds_ranked.empty:
 symbols = preds_ranked["ticker"].dropna().astype(str).str.upper().unique().tolist()
 
 # -----------------------
+# Resolve working feed (auto-fallback if needed)
+# -----------------------
+feed_used, feed_reason = _resolve_effective_feed(chosen_feed)
+if feed_reason != "ok":
+    st.warning(f"Selected feed '{chosen_feed}' isn’t available with your credentials. "
+               f"Using '{feed_used}' instead.")
+st.caption(f"📡 Data feed in use: **{feed_used}**")
+
+# -----------------------
 # Data fetch: open price and latest price
 # -----------------------
-open_px = _fetch_open_prices(symbols, session_open, session_close, feed_name=chosen_feed)
-last_px = _fetch_latest_prices(symbols, feed_name=chosen_feed)
+open_px = _fetch_open_prices(symbols, session_open, session_close, feed_name=feed_used)
+last_px = _fetch_latest_prices(symbols, feed_name=feed_used)
+
+now_et = datetime.now(tz=NY)
+if now_et < session_open:
+    st.info("Regular session hasn’t opened yet (09:30 ET). Open→now returns will populate after the open.")
 
 # Merge with predictions
 df_view = preds_ranked.merge(open_px.rename("open_today"), left_on="ticker", right_index=True, how="left")
@@ -496,7 +537,8 @@ with right:
         f"ranked_topN:   {preds_ranked.shape}\n"
         f"open_prices:   {open_px.shape}\n"
         f"latest_prices: {last_px.shape}\n"
-        f"joined_view:   {df_view.shape}",
+        f"joined_view:   {df_view.shape}\n"
+        f"feed_used:     {feed_used} ({feed_reason})",
         language="text",
     )
 

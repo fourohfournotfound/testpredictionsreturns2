@@ -1,9 +1,9 @@
 # app.py
-# Streamlit dashboard: rank-by-prediction + live intraday returns from open→now (Alpaca)
-# ---------------------------------------------------
+# Streamlit dashboard: rank-by-prediction + (delayed) intraday return from open→now using EODHD
+# ---------------------------------------------------------------------------------------------
 # - Robust to MultiIndex (ticker,date) inputs
 # - Enforces session alignment and avoids look-ahead bias by default (uses target session's regular open)
-# - Fast batched data fetch via alpaca-py
+# - Fast batched data fetch via EODHD Live v2 (us-quote-delayed) + optional real-time WebSockets override
 # - Auto-refresh on a timer; no background infra required
 #
 # Expected predictions CSV (flexible):
@@ -13,22 +13,24 @@
 # If your file is MultiIndex with ('ticker','date'), that works too — we normalize it.
 #
 # Usage:
-#   1) Put Alpaca keys in Streamlit Secrets (TOML) on Community Cloud, or env vars locally.
+#   1) Put EODHD API token in Streamlit Secrets or env as EODHD_API_TOKEN.
 #   2) streamlit run app.py
 #
 # Notes:
-# - "Open" means *regular trading session open* (09:30 America/New_York) per the market calendar.
-# - Feed selection is honored for both historical bars and latest trades.
-# - If you only have the free plan, SIP may not be available; we will auto-fallback to IEX or DELAYED_SIP.
+# - "Open" means *regular trading session open* (09:30 America/New_York); we use EODHD Live v2 'open' field.
+# - Default feed is 15–20 min delayed per EODHD docs (Live v2: us-quote-delayed).
+# - Optional real-time (WebSocket) override for latest prices (plan-dependent). Falls back gracefully.
 #
 # Safety:
 # - We never place orders; this is read-only market data for monitoring predictions/returns.
-# ---------------------------------------------------
+# ---------------------------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
 import io
+import json
+import math
 from datetime import datetime, date, time, timedelta
 from typing import List, Dict, Tuple, Optional
 
@@ -37,29 +39,28 @@ import pandas as pd
 import pytz
 from dateutil import parser as dateparser
 
+import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# Alpaca
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import (
-    StockBarsRequest,
-    StockLatestTradeRequest,
-)
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed, Adjustment
-
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetCalendarRequest
+# Optional: real-time WS via eodhdc (community client). If missing or plan not entitled -> we fallback.
+try:
+    from eodhdc import EODHDWebSockets  # type: ignore
+    _HAS_EODHDC = True
+except Exception:
+    _HAS_EODHDC = False
 
 # -----------------------
 # Page config
 # -----------------------
-st.set_page_config(page_title="Live LTR Monitor (Alpaca)", layout="wide")
+st.set_page_config(page_title="Live LTR Monitor (EODHD)", layout="wide")
 
 NY = pytz.timezone("America/New_York")
-BATCH_SIZE = 200  # conservative batch size for market data requests
-OPEN_LOOKAHEAD_MIN = 5  # only fetch first 5 minutes after 09:30 for open price
+
+# API & batching params tuned for Live v2 delayed endpoint.
+BATCH_SIZE_HTTP = 100   # Live v2 supports 's=' list; docs show pagination up to 100/page.
+WS_COLLECT_SECONDS = 2  # short collection window to grab last trade updates when WS enabled
+OPEN_LOOKAHEAD_MIN = 5  # only relevant if we ever fall back to intraday bars (not used by default)
 
 # -----------------------
 # Secrets / env & helpers
@@ -70,15 +71,10 @@ def _get_secret(name, default=None, table=None):
     except Exception:
         return os.environ.get(name, default)
 
-API_KEY    = _get_secret("APCA_API_KEY_ID") or _get_secret("APCA_API_KEY_ID", table="alpaca")
-API_SECRET = _get_secret("APCA_API_SECRET_KEY") or _get_secret("APCA_API_SECRET_KEY", table="alpaca")
-DATA_FEED_ENV = (_get_secret("APCA_DATA_FEED") or _get_secret("APCA_DATA_FEED", table="alpaca") or "IEX").upper()
-BASE_URL   = _get_secret("APCA_API_BASE_URL") or _get_secret("APCA_API_BASE_URL", table="alpaca")
-
-# (optional) mirror to env in case libs auto-read environment variables
-if API_KEY:    os.environ["APCA_API_KEY_ID"] = API_KEY
-if API_SECRET: os.environ["APCA_API_SECRET_KEY"] = API_SECRET
-if BASE_URL:   os.environ["APCA_API_BASE_URL"] = BASE_URL
+API_TOKEN = _get_secret("EODHD_API_TOKEN") or _get_secret("API_TOKEN", table="eodhd")
+BASE_HOST = "https://eodhd.com"
+LIVE_V2_URL = f"{BASE_HOST}/api/us-quote-delayed"   # Live v2 (US delayed, extended quotes)
+LIVE_V1_URL = f"{BASE_HOST}/api/real-time"          # Live v1 (OHLCV snapshot, multi-asset) [fallback capable]
 
 # Common default CSV locations
 DEFAULT_PREDICTIONS_PATHS = [
@@ -87,61 +83,26 @@ DEFAULT_PREDICTIONS_PATHS = [
     "/mnt/data/live_predictions.csv",
 ]
 
-FEED_MAP = {"IEX": DataFeed.IEX, "SIP": DataFeed.SIP, "DELAYED_SIP": DataFeed.DELAYED_SIP}
-DEFAULT_FEED = FEED_MAP.get(DATA_FEED_ENV, DataFeed.IEX)
-
-def _ensure_api_keys() -> None:
-    missing = []
-    if not API_KEY:
-        missing.append("APCA_API_KEY_ID")
-    if not API_SECRET:
-        missing.append("APCA_API_SECRET_KEY")
-    if missing:
+def _ensure_api_token() -> None:
+    if not API_TOKEN:
         st.error(
-            "Missing Alpaca credentials: "
-            + ", ".join(missing)
-            + ". Add them in **Streamlit Secrets** (TOML) or environment variables, then rerun."
+            "Missing EODHD credentials: **EODHD_API_TOKEN**. "
+            "Add it in **Streamlit Secrets** or environment variables, then rerun."
         )
         st.stop()
 
 # -----------------------
-# Debug panel (optional)
+# Requests session as cached resource
 # -----------------------
-with st.sidebar.expander("🔍 Secrets debug"):
-    try:
-        st.write("Top-level keys:", list(st.secrets.keys()))
-        st.write("Has APCA_API_KEY_ID?", "APCA_API_KEY_ID" in st.secrets)
-        st.write("Has [alpaca] table?", "alpaca" in st.secrets)
-        if "alpaca" in st.secrets:
-            st.write("Keys in [alpaca]:", list(st.secrets["alpaca"].keys()))
-    except Exception as e:
-        st.write("st.secrets unavailable:", repr(e))
-        st.write("env APCA_API_KEY_ID present?", bool(os.environ.get("APCA_API_KEY_ID")))
-
-# -----------------------
-# Clients as cached resources (best practice)
-# -----------------------
-def _infer_is_paper(base_url: Optional[str]) -> bool:
-    """Default to paper when no BASE_URL is provided; else treat 'paper-api' host as paper."""
-    if not base_url:
-        return True
-    return "paper-api" in base_url
-
 @st.cache_resource(show_spinner=False)
-def _init_clients(api_key: str, api_secret: str, base_url: Optional[str]) -> Tuple[StockHistoricalDataClient, TradingClient]:
-    """Initialize Alpaca clients once per session/process."""
-    data_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
-    trading_client = TradingClient(
-        api_key,
-        api_secret,
-        paper=_infer_is_paper(base_url),
-        url_override=base_url if base_url else None
-    )
-    return data_client, trading_client
+def _init_http_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "ltr-monitor/1.0"})
+    return s
 
 # Instantiate resources early so downstream cached functions can reference them
-_ensure_api_keys()
-data_client, trading_client = _init_clients(API_KEY, API_SECRET, BASE_URL)
+_ensure_api_token()
+_http = _init_http_session()
 
 # -----------------------
 # Sidebar UI
@@ -149,14 +110,16 @@ data_client, trading_client = _init_clients(API_KEY, API_SECRET, BASE_URL)
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    st.caption(f"🔐 Alpaca key loaded: {'yes' if bool(API_KEY) else 'no'} | feed default={DATA_FEED_ENV}")
+    st.caption(f"🔐 EODHD token loaded: {'yes' if bool(API_TOKEN) else 'no'}")
 
-    st.write("**Alpaca Data Feed**")
-    chosen_feed = st.selectbox(
-        "Feed (IEX=single-venue realtime; SIP=consolidated realtime; DELAYED_SIP=15-min delay)",
-        options=["IEX", "SIP", "DELAYED_SIP"],
-        index=["IEX", "SIP", "DELAYED_SIP"].index(DATA_FEED_ENV if DATA_FEED_ENV in ["IEX","SIP","DELAYED_SIP"] else "IEX"),
-        help="Pick SIP if your subscription includes it; DELAYED_SIP is 15-min delayed consolidated tape."
+    st.write("**Feed mode**")
+    ws_enabled = st.checkbox(
+        "Use real‑time WebSocket for latest price (experimental)",
+        value=False,
+        help=(
+            "Requires an EODHD plan with WebSockets entitlement and the 'eodhdc' package. "
+            "If unavailable, the app automatically falls back to delayed HTTP (15–20 min)."
+        ),
     )
 
     st.write("**Auto refresh**")
@@ -175,7 +138,15 @@ with st.sidebar:
 
     st.write("**Session date**")
     today_ny = datetime.now(tz=NY).date()
-    session_date = st.date_input("Target trading session (ET)", value=today_ny)
+    session_date = st.date_input("Target trading session (ET)", value=toady_ny if (toady_ny:=today_ny) else today_ny)  # defensive alias
+
+    st.write("**Symbol format**")
+    exchange_suffix = st.text_input(
+        "Default exchange suffix (appends if missing)",
+        value="US",
+        help="EODHD uses exchange-suffixed symbols (e.g., AAPL.US). "
+             "If your CSV already includes suffixes, we keep them as-is.",
+    )
 
     st.write("**Ranking**")
     top_n = st.number_input("Show top N by prediction", min_value=1, max_value=5000, value=200, step=1)
@@ -186,7 +157,7 @@ with st.sidebar:
     allow_na_returns = st.checkbox("Include symbols with missing data (NA returns)", value=False)
 
 # -----------------------
-# Data loaders / normalizers (cache_data with hashable args only)
+# Data loaders / normalizers
 # -----------------------
 def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     # Reset MultiIndex if needed
@@ -277,7 +248,7 @@ def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guar
 # Calendar utilities
 # -----------------------
 def _regular_session_bounds(session: date) -> Tuple[datetime, datetime]:
-    """Fallback: 09:30–16:00 ET for the given date."""
+    """Default: 09:30–16:00 ET for the given date."""
     return (
         NY.localize(datetime.combine(session, time(9, 30))),
         NY.localize(datetime.combine(session, time(16, 0))),
@@ -286,131 +257,151 @@ def _regular_session_bounds(session: date) -> Tuple[datetime, datetime]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def _get_session_open_close(session: date) -> Tuple[Optional[datetime], Optional[datetime], str]:
     """
-    Use Alpaca's Trading API calendar for the exact open/close (handles early closes).
-    If the call fails, fall back to 09:30–16:00 ET so the app keeps working.
+    For robustness and to avoid external entitlements, we use the standard 09:30–16:00 ET window,
+    and treat exchange holidays (if we detect them) as closed. If the exchange holiday check fails,
+    we still return 09:30–16:00 so the UI remains usable.
     """
     try:
-        req = GetCalendarRequest(start=session, end=session)
-        cal = trading_client.get_calendar(req)
-        if not cal:
-            return None, None, "not_session"
-        c = cal[0]
-        open_et = c.open if c.open.tzinfo else NY.localize(c.open)
-        close_et = c.close if c.close.tzinfo else NY.localize(c.close)
-        return open_et.astimezone(NY), close_et.astimezone(NY), "alpaca_trading_calendar"
+        # Optional: call EODHD exchange details to detect holidays. If it errors, keep regular hours.
+        url = f"{BASE_HOST}/api/exchange-details/US?api_token={API_TOKEN}&fmt=json"
+        r = _http.get(url, timeout=10)
+        if r.ok:
+            data = r.json()
+            # Best-effort holiday check (shape varies by doc; avoid hard reliance).
+            holidays = data.get("holidays") or data.get("StockMarketHolidays") or []
+            holiday_dates = set()
+            for h in holidays:
+                # try common keys, fall back to parsing strings
+                d = h.get("date") or h.get("Date")
+                if d:
+                    try:
+                        holiday_dates.add(pd.to_datetime(d).date())
+                    except Exception:
+                        pass
+            if session in holiday_dates:
+                return None, None, "holiday"
     except Exception:
-        open_et, close_et = _regular_session_bounds(session)
-        st.warning("Calendar API unavailable; falling back to regular session 09:30–16:00 ET for this date.")
-        return open_et, close_et, "fallback_regular"
+        pass
+
+    open_et, close_et = _regular_session_bounds(session)
+    return open_et, close_et, "regular"
 
 # -----------------------
-# Feed probing & fallback
+# Symbol normalization
 # -----------------------
-def _is_auth_or_perm_error(err: Exception) -> bool:
-    s = str(err).lower()
-    # Common signals: 401/403, 'unauthorized', 'forbidden', 'subscription', 'not permit', nginx auth
-    return any(k in s for k in ["401", "403", "unauthorized", "forbidden", "subscription", "not permit", "authorization required"])
+def _to_eod_symbol(ticker: str, suffix: str) -> str:
+    ticker = (ticker or "").strip().upper()
+    if "." in ticker:
+        return ticker  # already suffixed
+    return f"{ticker}.{suffix.strip().upper()}"
 
-@st.cache_data(show_spinner=False, ttl=300)
-def _resolve_effective_feed(preferred_feed: str) -> Tuple[str, str]:
-    """
-    Probe the preferred feed with a tiny request. If unauthorized or not entitled,
-    fall back to IEX, then to DELAYED_SIP. Returns (feed_used, reason).
-    """
-    test_symbol = "AAPL"
-    order = [preferred_feed, "IEX", "DELAYED_SIP"]
-    tried = []
-    for name in order:
-        if name in tried:
-            continue
-        tried.append(name)
-        try:
-            req = StockLatestTradeRequest(symbol_or_symbols=[test_symbol], feed=FEED_MAP[name])
-            _ = data_client.get_stock_latest_trade(req)  # dict
-            return name, "ok" if name == preferred_feed else f"fallback_from_{preferred_feed}"
-        except Exception as e:
-            if _is_auth_or_perm_error(e):
-                continue  # try next
-            else:
-                # Non-auth error: still try next, but annotate
-                continue
-    # If none worked, default to IEX to avoid None
-    return "IEX", "forced_iex"
+def _strip_suffix(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    return s.split(".")[0]
 
 # -----------------------
-# Data fetchers (cache_data with TTL; never pass client objects)
+# EODHD Live v2 (delayed) HTTP fetchers
 # -----------------------
-@st.cache_data(show_spinner=False, ttl=300)
-def _fetch_open_prices(
-    symbols: List[str],
-    session_open: datetime,
-    session_close: datetime,
-    feed_name: str
-) -> pd.Series:
-    """Return a Series indexed by symbol with the first minute bar 'open' at/after session_open."""
-    if not symbols:
-        return pd.Series(dtype=float)
-
-    now_et = datetime.now(tz=NY)
-    if now_et < session_open:
-        # too early; no regular-session bars exist yet
-        return pd.Series(dtype=float)
-
-    end_for_open = min(session_open + timedelta(minutes=OPEN_LOOKAHEAD_MIN), now_et, session_close)
-    req = StockBarsRequest(
-        symbol_or_symbols=symbols,
-        timeframe=TimeFrame.Minute,
-        start=session_open,
-        end=end_for_open,
-        feed=FEED_MAP[feed_name],
-        adjustment=Adjustment.SPLIT,
-    )
-
-    try:
-        bars = data_client.get_stock_bars(req)
-        df = bars.df  # MultiIndex: (symbol, timestamp)
-    except Exception as e:
-        st.error(f"Failed to fetch open prices ({feed_name}): {e}")
-        return pd.Series(dtype=float)
-
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    first_open = (
-        df.sort_index(level=["symbol", "timestamp"])
-          .groupby("symbol")["open"]
-          .first()
-    )
-    first_open.name = "open_today"
-    return first_open
+def _chunk(lst: List[str], n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
 @st.cache_data(show_spinner=False, ttl=5)
-def _fetch_latest_prices(
-    symbols: List[str],
-    feed_name: str
-) -> pd.Series:
-    """Return a Series indexed by symbol with the latest trade price."""
-    if not symbols:
-        return pd.Series(dtype=float)
+def _fetch_live_v2_quotes(symbols_eod: List[str]) -> pd.DataFrame:
+    """
+    Calls Live v2 (us-quote-delayed) for up to 100 symbols per request and returns a DataFrame
+    indexed by EODHD symbol with columns: ['open', 'lastTradePrice', 'timestamp'].
+    """
+    if not symbols_eod:
+        return pd.DataFrame(columns=["symbol", "open", "lastTradePrice", "timestamp"]).set_index("symbol")
 
-    prices: Dict[str, float] = {}
-    try:
-        for i in range(0, len(symbols), BATCH_SIZE):
-            chunk = symbols[i : i + BATCH_SIZE]
-            req = StockLatestTradeRequest(symbol_or_symbols=chunk, feed=FEED_MAP[feed_name])
-            latest = data_client.get_stock_latest_trade(req)  # dict: symbol -> Trade
-            for sym, trade in (latest or {}).items():
-                try:
-                    prices[sym] = float(trade.price)
-                except Exception:
+    frames = []
+    for chunk_syms in _chunk(symbols_eod, BATCH_SIZE_HTTP):
+        s_param = ",".join(chunk_syms)
+        url = f"{LIVE_V2_URL}?s={s_param}&api_token={API_TOKEN}&fmt=json"
+        try:
+            r = _http.get(url, timeout=10)
+            if not r.ok:
+                continue
+            payload = r.json()
+            data = payload.get("data", {})
+            rows = []
+            for sym, d in (data or {}).items():
+                if not isinstance(d, dict):
                     continue
-    except Exception as e:
-        st.error(f"Failed to fetch latest prices ({feed_name}): {e}")
+                rows.append({
+                    "symbol": sym,
+                    "open": d.get("open", np.nan),
+                    "lastTradePrice": d.get("lastTradePrice", np.nan),
+                    "timestamp": d.get("lastTradeTime") or d.get("timestamp")
+                })
+            if rows:
+                frames.append(pd.DataFrame(rows))
+        except Exception:
+            # continue to next chunk to be robust
+            continue
+
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "open", "lastTradePrice", "timestamp"]).set_index("symbol")
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["symbol"]).set_index("symbol")
+    return out
+
+# -----------------------
+# Optional: EODHD WebSocket latest prices
+# -----------------------
+@st.cache_data(show_spinner=False, ttl=2)  # very short TTL; WS provides fresh prints when called
+def _fetch_latest_prices_ws(symbols_eod: List[str]) -> pd.Series:
+    """
+    Uses eodhdc WebSockets 'us' endpoint to collect latest trade prices for given tickers.
+    Symbols are subscribed WITHOUT the '.US' suffix per eodhdc examples. If anything fails,
+    returns empty Series, and caller should fall back to HTTP delayed.
+    """
+    if not _HAS_EODHDC or not symbols_eod:
         return pd.Series(dtype=float)
 
-    s = pd.Series(prices, dtype=float)
-    s.name = "last_price"
-    return s
+    # WS expects raw tickers (e.g., AAPL, TSLA)
+    tickers = sorted({_strip_suffix(s) for s in symbols_eod})
+
+    try:
+        import asyncio
+        prices: Dict[str, float] = {}
+
+        async def _collect():
+            ws = EODHDWebSockets(key=API_TOKEN, buffer=1000)
+            # 'us' stream for trades; could also try 'us-quote' for quotes
+            async with ws.connect("us") as websocket:
+                await ws.subscribe(websocket, tickers)
+                start = datetime.now()
+                async for msg in ws.receive(websocket):
+                    # msg can be dict or string; handle both
+                    if isinstance(msg, str):
+                        try:
+                            msg = json.loads(msg)
+                        except Exception:
+                            continue
+                    # Try common fields across EODHD streams:
+                    # symbol under 's' or 'code', price under 'p' or 'price'
+                    sym = (msg.get("s") or msg.get("code") or "").upper()
+                    px = msg.get("p") or msg.get("price") or msg.get("lastTradePrice")
+                    if sym and isinstance(px, (int, float)):
+                        prices[sym] = float(px)
+                    # Exit after WS_COLLECT_SECONDS
+                    if (datetime.now() - start).total_seconds() >= WS_COLLECT_SECONDS:
+                        ws.deactivate()  # stop receive loop
+                # after exit, prices dict holds most recent prints observed
+            # Map back to EODHD '.US' symbols where possible
+            mapped = {}
+            for s in symbols_eod:
+                base = _strip_suffix(s)
+                if base in prices:
+                    mapped[s] = prices[base]
+            return pd.Series(mapped, dtype=float)
+
+        return asyncio.run(_collect())
+    except Exception:
+        return pd.Series(dtype=float)
 
 # -----------------------
 # Load predictions
@@ -447,10 +438,10 @@ st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 # -----------------------
 session_open, session_close, session_source = _get_session_open_close(session_date)
 if session_open is None:
-    st.warning(f"Selected date {session_date} is **not** a US trading session. Pick a valid session.")
+    st.warning(f"Selected date {session_date} is **not** a US trading session (holiday). Pick a valid session.")
     st.stop()
-if session_source == "fallback_regular":
-    st.caption("⚠️ Using fallback 09:30–16:00 ET session bounds (Alpaca calendar unavailable). Early closes not reflected.")
+if session_source != "regular":
+    st.caption("⚠️ Using standard 09:30–16:00 ET session bounds (holidays excluded).")
 
 # Enforce as_of guard now that we know session_open
 preds_ranked = _post_asof_guard(preds_ranked, session_open, require_asof_guard=require_asof_guard)
@@ -460,38 +451,46 @@ if preds_ranked.empty:
                "Uncheck it in the sidebar if your predictions were created intraday and you still want open→now returns.")
     st.stop()
 
-symbols = preds_ranked["ticker"].dropna().astype(str).str.upper().unique().tolist()
+# Normalize symbols for EODHD
+symbols_in = preds_ranked["ticker"].dropna().astype(str).str.upper().tolist()
+symbols_eod = [_to_eod_symbol(t, exchange_suffix) for t in symbols_in]
 
 # -----------------------
-# Resolve working feed (auto-fallback if needed)
+# Data fetch (Live v2 delayed) + optional realtime WS override
 # -----------------------
-feed_used, feed_reason = _resolve_effective_feed(chosen_feed)
-if feed_reason != "ok":
-    st.warning(f"Selected feed '{chosen_feed}' isn’t available with your credentials. "
-               f"Using '{feed_used}' instead.")
-st.caption(f"📡 Data feed in use: **{feed_used}**")
+quotes = _fetch_live_v2_quotes(symbols_eod)  # index: EOD symbol; cols: open, lastTradePrice, timestamp
 
-# -----------------------
-# Data fetch: open price and latest price
-# -----------------------
-open_px = _fetch_open_prices(symbols, session_open, session_close, feed_name=feed_used)
-last_px = _fetch_latest_prices(symbols, feed_name=feed_used)
+# Optional WebSocket override for last price (graceful fallback)
+if ws_enabled:
+    if not _HAS_EODHDC:
+        st.info("WebSocket client 'eodhdc' not installed; using delayed HTTP. "
+                "Add `eodhdc` to your environment to enable WS override.")
+    else:
+        ws_px = _fetch_latest_prices_ws(symbols_eod)
+        if not ws_px.empty:
+            # Align indices and overwrite lastTradePrice with real-time where available
+            quotes.loc[ws_px.index, "lastTradePrice"] = ws_px
 
 now_et = datetime.now(tz=NY)
 if now_et < session_open:
     st.info("Regular session hasn’t opened yet (09:30 ET). Open→now returns will populate after the open.")
 
-# Merge with predictions
-df_view = preds_ranked.merge(open_px.rename("open_today"), left_on="ticker", right_index=True, how="left")
-df_view = df_view.merge(last_px.rename("last_price"), left_on="ticker", right_index=True, how="left")
+# -----------------------
+# Merge with predictions & compute returns
+# -----------------------
+# Build mapping from original ticker -> EOD symbol to join
+map_df = pd.DataFrame({"ticker": symbols_in, "eod_symbol": symbols_eod}).drop_duplicates()
 
-# Compute intraday return from session open → now
-df_view["return_open_to_now"] = (df_view["last_price"] / df_view["open_today"] - 1.0).replace([np.inf, -np.inf], np.nan)
+df_view = preds_ranked.merge(map_df, on="ticker", how="left")
+df_view = df_view.merge(quotes[["open", "lastTradePrice"]], left_on="eod_symbol", right_index=True, how="left")
+
+# Compute intraday return from session open → now (delayed or realtime depending on source)
+df_view["return_open_to_now"] = (df_view["lastTradePrice"] / df_view["open"] - 1.0).replace([np.inf, -np.inf], np.nan)
 
 # Optionally drop rows with NA returns
 if not allow_na_returns:
     before = df_view.shape
-    df_view = df_view.dropna(subset=["open_today", "last_price", "return_open_to_now"])
+    df_view = df_view.dropna(subset=["open", "lastTradePrice", "return_open_to_now"])
     st.caption(f"📐 After dropping NA returns: {before} → {df_view.shape}")
 
 # Final sorting by your prediction score
@@ -503,8 +502,9 @@ def _fmt_pct(x):
 def _fmt_price(x):
     return "" if pd.isna(x) else f"{x:.2f}"
 
-display_cols = ["rank", "ticker", "prediction", "open_today", "last_price", "return_open_to_now"]
+display_cols = ["rank", "ticker", "prediction", "open", "lastTradePrice", "return_open_to_now"]
 show = df_view[display_cols].copy()
+show.rename(columns={"open": "open_today", "lastTradePrice": "last_price"}, inplace=True)
 show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
@@ -512,15 +512,16 @@ show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
 # -----------------------
 # Main layout
 # -----------------------
-st.title("📈 Live LTR Monitor — Predictions vs Open→Now Returns")
+st.title("📈 Live LTR Monitor — Predictions vs Open→Now Returns (EODHD)")
 st.caption(
-    "Sorted by your prediction score. Returns are computed from the **regular session open (09:30 ET)** for the selected session to the latest trade. "
-    "Use the sidebar to pick the session date, feed, and refresh interval."
+    "Sorted by your prediction score. Returns are computed from the **regular session open (09:30 ET)** "
+    "for the selected session to the latest price. Default data is **15–20 min delayed**; "
+    "enable the WebSocket option for real-time last trades if your plan allows."
 )
 
 left, right = st.columns([3, 2], gap="large")
 with left:
-    st.subheader("Top predictions (live returns)")
+    st.subheader("Top predictions (live or delayed returns)")
     st.dataframe(show, use_container_width=True, height=650)
 
 with right:
@@ -535,10 +536,9 @@ with right:
     st.code(
         f"predictions_raw: {preds.shape}\n"
         f"ranked_topN:   {preds_ranked.shape}\n"
-        f"open_prices:   {open_px.shape}\n"
-        f"latest_prices: {last_px.shape}\n"
+        f"quotes_livev2: {quotes.shape}\n"
         f"joined_view:   {df_view.shape}\n"
-        f"feed_used:     {feed_used} ({feed_reason})",
+        f"feed_mode:     {'WS realtime override' if ws_enabled and _HAS_EODHDC else 'HTTP delayed (Live v2)'}",
         language="text",
     )
 
@@ -554,5 +554,5 @@ st.download_button(
 
 st.caption(
     "Tip: If your predictions are for **tomorrow’s** session, set the session date accordingly. "
-    "The app will fetch that day’s open once it happens and compute returns thereafter."
+    "The app will compute returns after the next open."
 )

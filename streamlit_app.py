@@ -775,8 +775,28 @@ else:
     long_short_spread = np.nan
 avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
 
-top_win_rate = float((top_slice["return_open_to_now"] > 0).mean()) if not top_slice.empty else np.nan
-bottom_win_rate = float((bottom_slice["return_open_to_now"] < 0).mean()) if not bottom_slice.empty else np.nan
+benchmark_return = avg_return_all
+
+def _long_hit_mask(returns: pd.Series, benchmark: float) -> pd.Series:
+    if pd.isna(benchmark):
+        return returns > 0
+    return returns > benchmark
+
+def _short_hit_mask(returns: pd.Series, benchmark: float) -> pd.Series:
+    if pd.isna(benchmark):
+        return returns < 0
+    return returns < benchmark
+
+top_win_rate = (
+    float(_long_hit_mask(top_slice["return_open_to_now"], benchmark_return).mean())
+    if not top_slice.empty
+    else np.nan
+)
+bottom_win_rate = (
+    float(_short_hit_mask(bottom_slice["return_open_to_now"], benchmark_return).mean())
+    if not bottom_slice.empty
+    else np.nan
+)
 
 topk_depth_returns = pd.DataFrame()
 topk_depth_hits = pd.DataFrame()
@@ -784,7 +804,9 @@ if not returns_ready_sorted.empty:
     long_curve = returns_ready_sorted[["return_open_to_now"]].reset_index(drop=True)
     long_curve["top_k"] = np.arange(1, len(long_curve) + 1)
     long_curve["mean_return"] = long_curve["return_open_to_now"].expanding().mean()
-    long_curve["hit_rate"] = (long_curve["return_open_to_now"] > 0).expanding().mean()
+    long_curve["hit_rate"] = (
+        _long_hit_mask(long_curve["return_open_to_now"], benchmark_return).expanding().mean()
+    )
 
     short_curve = (
         returns_ready_sorted.sort_values("rank", ascending=False)[
@@ -794,7 +816,9 @@ if not returns_ready_sorted.empty:
     )
     short_curve["top_k"] = np.arange(1, len(short_curve) + 1)
     short_curve["mean_return"] = short_curve["return_open_to_now"].expanding().mean()
-    short_curve["hit_rate"] = (short_curve["return_open_to_now"] < 0).expanding().mean()
+    short_curve["hit_rate"] = (
+        _short_hit_mask(short_curve["return_open_to_now"], benchmark_return).expanding().mean()
+    )
 
     short_curve["short_mean_pnl"] = -short_curve["mean_return"]
     long_short_spread_curve = 0.5 * (
@@ -833,14 +857,14 @@ if not returns_ready_sorted.empty:
             pd.DataFrame(
                 {
                     "top_k": long_curve["top_k"],
-                    "series": "Long hit rate (>0%)",
+                    "series": "Long hit rate (> equal-weight benchmark)",
                     "value": long_curve["hit_rate"],
                 }
             ),
             pd.DataFrame(
                 {
                     "top_k": short_curve["top_k"],
-                    "series": "Short hit rate (<0%)",
+                    "series": "Short hit rate (< equal-weight benchmark)",
                     "value": short_curve["hit_rate"],
                 }
             ),
@@ -1206,7 +1230,7 @@ if not returns_ready_sorted.empty:
     st.subheader("🚦 Performance snapshot")
     summary_cols = st.columns(4, gap="large")
     with summary_cols[0]:
-        st.metric("Avg return (all ranked)", _fmt_pct_display(avg_return_all))
+        st.metric("Equal-weight benchmark return", _fmt_pct_display(benchmark_return))
     with summary_cols[1]:
         st.metric(
             f"Top-{top_k_count or summary_topk} mean",
@@ -1223,13 +1247,13 @@ if not returns_ready_sorted.empty:
     rate_cols = st.columns(2, gap="large")
     with rate_cols[0]:
         st.metric(
-            f"Top-{top_k_count or summary_topk} hit rate",
+            f"Top-{top_k_count or summary_topk} hit rate vs benchmark",
             _fmt_pct_display(top_win_rate),
             delta=_fmt_delta_points(top_win_rate - 0.5) if pd.notna(top_win_rate) else None,
         )
     with rate_cols[1]:
         st.metric(
-            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate (<0%)",
+            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate vs benchmark",
             _fmt_pct_display(bottom_win_rate),
             delta=_fmt_delta_points(bottom_win_rate - 0.5) if pd.notna(bottom_win_rate) else None,
         )
@@ -1288,8 +1312,8 @@ with left:
                     title="",
                     scale=alt.Scale(
                         domain=[
-                            "Long hit rate (>0%)",
-                            "Short hit rate (<0%)",
+                            "Long hit rate (> equal-weight benchmark)",
+                            "Short hit rate (< equal-weight benchmark)",
                         ],
                         range=["#2980b9", "#8e44ad"],
                     ),
@@ -1363,7 +1387,7 @@ with right:
     st.metric("Symbols shown", f"{show.shape[0]:,}")
     st.metric("Symbols with realized returns", f"{len(returns_ready_sorted):,}")
     if not returns_ready_sorted.empty:
-        st.metric("Average realized return", _fmt_pct_display(avg_return_all))
+        st.metric("Equal-weight benchmark return", _fmt_pct_display(benchmark_return))
         st.metric(
             f"Top-{top_k_count or summary_topk} mean return",
             _fmt_pct_display(top_mean),
@@ -1374,11 +1398,11 @@ with right:
         )
         st.metric("Equal-weight long–short spread", _fmt_pct_display(long_short_spread))
         st.metric(
-            f"Top-{top_k_count or summary_topk} hit rate",
+            f"Top-{top_k_count or summary_topk} hit rate vs benchmark",
             _fmt_pct_display(top_win_rate),
         )
         st.metric(
-            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate (<0%)",
+            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate vs benchmark",
             _fmt_pct_display(bottom_win_rate),
         )
 

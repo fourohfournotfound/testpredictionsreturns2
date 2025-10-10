@@ -739,6 +739,11 @@ show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
 show["baseline_prediction"] = show["baseline_prediction"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.6f}")
 
+returns_ready = df_view[df_view["return_open_to_now"].notna()].copy()
+returns_ready_sorted = returns_ready.sort_values("rank") if not returns_ready.empty else returns_ready
+avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
+benchmark_return = avg_return_all
+
 chart_data = (
     df_view[["rank", "ticker", "prediction", "return_open_to_now"]]
     .dropna(subset=["return_open_to_now"])
@@ -764,9 +769,6 @@ if not chart_data.empty:
     chart_data.sort_values("rank", inplace=True)
 
 
-returns_ready = df_view[df_view["return_open_to_now"].notna()].copy()
-returns_ready_sorted = returns_ready.sort_values("rank") if not returns_ready.empty else returns_ready
-
 top_k_count = int(min(int(summary_topk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
 bottom_k_count = int(min(int(summary_bottomk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
 
@@ -784,10 +786,6 @@ if not top_slice.empty and not bottom_slice.empty:
     long_short_spread = (long_leg_sum + short_leg_sum) / total_positions if total_positions else np.nan
 else:
     long_short_spread = np.nan
-avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
-
-benchmark_return = avg_return_all
-
 def _long_hit_mask(returns: pd.Series, benchmark: float) -> pd.Series:
     if pd.isna(benchmark):
         return returns > 0

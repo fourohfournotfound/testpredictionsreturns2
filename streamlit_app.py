@@ -790,28 +790,30 @@ if not returns_ready_sorted.empty:
     short_curve["mean_return"] = short_curve["return_open_to_now"].expanding().mean()
     short_curve["hit_rate"] = (short_curve["return_open_to_now"] < 0).expanding().mean()
 
+    short_curve["short_mean_pnl"] = -short_curve["mean_return"]
+    long_short_spread_curve = long_curve["mean_return"].values - short_curve["mean_return"].values
+
     topk_depth_returns = pd.concat(
         [
             pd.DataFrame(
                 {
                     "top_k": long_curve["top_k"],
-                    "series": "Long avg return (Top-K)",
+                    "series": "Long cumulative avg return",
                     "value": long_curve["mean_return"],
                 }
             ),
             pd.DataFrame(
                 {
                     "top_k": short_curve["top_k"],
-                    "series": "Short capture (Bottom-K, -return)",
-                    "value": -short_curve["mean_return"],
+                    "series": "Short cumulative avg return (short P&L)",
+                    "value": short_curve["short_mean_pnl"],
                 }
             ),
             pd.DataFrame(
                 {
                     "top_k": long_curve["top_k"],
-                    "series": "Long–short spread",
-                    "value": long_curve["mean_return"].values
-                    - short_curve["mean_return"].values,
+                    "series": "Long–short spread (avg)",
+                    "value": long_short_spread_curve,
                 }
             ),
         ],
@@ -1216,20 +1218,20 @@ if not returns_ready_sorted.empty:
 
 left, right = st.columns([3, 2], gap="large")
 with left:
-    st.subheader("Top-K depth curve")
+    st.subheader("Portfolio build-up by rank")
     st.caption(
-        "Tracks how the long basket, the short capture (−return), and the long–short spread evolve as you take more of the "
-        "ranked ideas. Hit-rate lines use the right-hand axis."
+        "Shows how cumulative average returns evolve as you add more names from the ranked list. "
+        "The short line converts negative returns into short-side P&L."
     )
     if not topk_depth_returns.empty:
         returns_chart = (
             alt.Chart(topk_depth_returns)
             .mark_line(point=alt.OverlayMarkDef(size=60, filled=True))
             .encode(
-                x=alt.X("top_k:Q", title="Top/Bottom K by model rank"),
+                x=alt.X("top_k:Q", title="Portfolio size (K)"),
                 y=alt.Y(
                     "value:Q",
-                    title="Return / Capture",
+                    title="Cumulative avg return",
                     axis=alt.Axis(format="%"),
                 ),
                 color=alt.Color(
@@ -1237,9 +1239,9 @@ with left:
                     title="",
                     scale=alt.Scale(
                         domain=[
-                            "Long avg return (Top-K)",
-                            "Short capture (Bottom-K, -return)",
-                            "Long–short spread",
+                            "Long cumulative avg return",
+                            "Short cumulative avg return (short P&L)",
+                            "Long–short spread (avg)",
                         ],
                         range=["#1abc9c", "#e67e22", "#f1c40f"],
                     ),
@@ -1251,15 +1253,16 @@ with left:
                 ],
             )
         )
+        st.altair_chart(returns_chart.interactive(), use_container_width=True)
 
         hits_chart = (
             alt.Chart(topk_depth_hits)
             .mark_line(point=alt.OverlayMarkDef(size=50, filled=True), strokeDash=[4, 4])
             .encode(
-                x=alt.X("top_k:Q"),
+                x=alt.X("top_k:Q", title="Portfolio size (K)"),
                 y=alt.Y(
                     "value:Q",
-                    title="Hit rate",
+                    title="Cumulative hit rate",
                     axis=alt.Axis(format="%"),
                 ),
                 color=alt.Color(
@@ -1280,11 +1283,7 @@ with left:
                 ],
             )
         )
-
-        depth_chart = alt.layer(returns_chart, hits_chart).resolve_scale(
-            y="independent", color="independent"
-        )
-        st.altair_chart(depth_chart.interactive(), use_container_width=True)
+        st.altair_chart(hits_chart.interactive(), use_container_width=True)
     else:
         st.info("Performance lines populate once realized returns are available.")
 

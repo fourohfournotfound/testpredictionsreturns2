@@ -772,26 +772,70 @@ avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not
 top_win_rate = float((top_slice["return_open_to_now"] > 0).mean()) if not top_slice.empty else np.nan
 bottom_win_rate = float((bottom_slice["return_open_to_now"] < 0).mean()) if not bottom_slice.empty else np.nan
 
-cumulative_chart_long = pd.DataFrame()
+topk_depth_returns = pd.DataFrame()
+topk_depth_hits = pd.DataFrame()
 if not returns_ready_sorted.empty:
-    cumulative_chart_data = returns_ready_sorted[["rank", "return_open_to_now"]].copy()
-    cumulative_chart_data.sort_values("rank", inplace=True)
-    cumulative_chart_data["top_k"] = np.arange(1, len(cumulative_chart_data) + 1)
-    cumulative_chart_data["top_k_mean_return"] = (
-        cumulative_chart_data["return_open_to_now"].expanding().mean()
+    long_curve = returns_ready_sorted[["return_open_to_now"]].reset_index(drop=True)
+    long_curve["top_k"] = np.arange(1, len(long_curve) + 1)
+    long_curve["mean_return"] = long_curve["return_open_to_now"].expanding().mean()
+    long_curve["hit_rate"] = (long_curve["return_open_to_now"] > 0).expanding().mean()
+
+    short_curve = (
+        returns_ready_sorted.sort_values("rank", ascending=False)[
+            ["return_open_to_now"]
+        ]
+        .reset_index(drop=True)
     )
-    cumulative_chart_data["top_k_hit_rate"] = (
-        (cumulative_chart_data["return_open_to_now"] > 0).expanding().mean()
+    short_curve["top_k"] = np.arange(1, len(short_curve) + 1)
+    short_curve["mean_return"] = short_curve["return_open_to_now"].expanding().mean()
+    short_curve["hit_rate"] = (short_curve["return_open_to_now"] < 0).expanding().mean()
+
+    topk_depth_returns = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "top_k": long_curve["top_k"],
+                    "series": "Long avg return (Top-K)",
+                    "value": long_curve["mean_return"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "top_k": short_curve["top_k"],
+                    "series": "Short capture (Bottom-K, -return)",
+                    "value": -short_curve["mean_return"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "top_k": long_curve["top_k"],
+                    "series": "Long–short spread",
+                    "value": long_curve["mean_return"].values
+                    - short_curve["mean_return"].values,
+                }
+            ),
+        ],
+        ignore_index=True,
     )
-    cumulative_chart_long = (
-        cumulative_chart_data[["top_k", "top_k_mean_return", "top_k_hit_rate"]]
-        .rename(
-            columns={
-                "top_k_mean_return": "Top-K average return",
-                "top_k_hit_rate": "Top-K hit rate (share > 0)",
-            }
-        )
-        .melt("top_k", var_name="metric", value_name="value")
+
+    topk_depth_hits = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "top_k": long_curve["top_k"],
+                    "series": "Long hit rate (>0%)",
+                    "value": long_curve["hit_rate"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "top_k": short_curve["top_k"],
+                    "series": "Short hit rate (<0%)",
+                    "value": short_curve["hit_rate"],
+                }
+            ),
+        ],
+        ignore_index=True,
     )
 
 
@@ -1174,34 +1218,73 @@ left, right = st.columns([3, 2], gap="large")
 with left:
     st.subheader("Top-K depth curve")
     st.caption(
-        "Shows the cross-sectional average return and hit rate as you include more of today's ranked ideas."
+        "Tracks how the long basket, the short capture (−return), and the long–short spread evolve as you take more of the "
+        "ranked ideas. Hit-rate lines use the right-hand axis."
     )
-    if not cumulative_chart_long.empty:
-        cumulative_chart = (
-            alt.Chart(cumulative_chart_long)
+    if not topk_depth_returns.empty:
+        returns_chart = (
+            alt.Chart(topk_depth_returns)
             .mark_line(point=alt.OverlayMarkDef(size=60, filled=True))
             .encode(
-                x=alt.X("top_k:Q", title="Top K by model rank"),
-                y=alt.Y("value:Q", title="Value", axis=alt.Axis(format="%")),
+                x=alt.X("top_k:Q", title="Top/Bottom K by model rank"),
+                y=alt.Y(
+                    "value:Q",
+                    title="Return / Capture",
+                    axis=alt.Axis(format="%"),
+                ),
                 color=alt.Color(
-                    "metric:N",
+                    "series:N",
                     title="",
                     scale=alt.Scale(
                         domain=[
-                            "Top-K average return",
-                            "Top-K hit rate (share > 0)",
+                            "Long avg return (Top-K)",
+                            "Short capture (Bottom-K, -return)",
+                            "Long–short spread",
                         ],
-                        range=["#1abc9c", "#9b59b6"],
+                        range=["#1abc9c", "#e67e22", "#f1c40f"],
                     ),
                 ),
                 tooltip=[
-                    alt.Tooltip("metric:N", title="Metric"),
-                    alt.Tooltip("top_k:Q", title="Top K"),
+                    alt.Tooltip("series:N", title="Metric"),
+                    alt.Tooltip("top_k:Q", title="K size"),
                     alt.Tooltip("value:Q", title="Value", format=".2%"),
                 ],
             )
         )
-        st.altair_chart(cumulative_chart.interactive(), use_container_width=True)
+
+        hits_chart = (
+            alt.Chart(topk_depth_hits)
+            .mark_line(point=alt.OverlayMarkDef(size=50, filled=True), strokeDash=[4, 4])
+            .encode(
+                x=alt.X("top_k:Q"),
+                y=alt.Y(
+                    "value:Q",
+                    title="Hit rate",
+                    axis=alt.Axis(format="%"),
+                ),
+                color=alt.Color(
+                    "series:N",
+                    title="",
+                    scale=alt.Scale(
+                        domain=[
+                            "Long hit rate (>0%)",
+                            "Short hit rate (<0%)",
+                        ],
+                        range=["#2980b9", "#8e44ad"],
+                    ),
+                ),
+                tooltip=[
+                    alt.Tooltip("series:N", title="Metric"),
+                    alt.Tooltip("top_k:Q", title="K size"),
+                    alt.Tooltip("value:Q", title="Value", format=".2%"),
+                ],
+            )
+        )
+
+        depth_chart = alt.layer(returns_chart, hits_chart).resolve_scale(
+            y="independent", color="independent"
+        )
+        st.altair_chart(depth_chart.interactive(), use_container_width=True)
     else:
         st.info("Performance lines populate once realized returns are available.")
 

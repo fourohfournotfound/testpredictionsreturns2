@@ -763,9 +763,13 @@ top_slice = returns_ready_sorted.head(top_k_count) if top_k_count else pd.DataFr
 bottom_slice = returns_ready_sorted.tail(bottom_k_count) if bottom_k_count else pd.DataFrame(columns=returns_ready.columns)
 
 top_mean = float(top_slice["return_open_to_now"].mean()) if not top_slice.empty else np.nan
-bottom_mean = float(bottom_slice["return_open_to_now"].mean()) if not bottom_slice.empty else np.nan
+bottom_short_mean = (
+    float((-bottom_slice["return_open_to_now"]).mean()) if not bottom_slice.empty else np.nan
+)
 long_short_spread = (
-    top_mean - bottom_mean if pd.notna(top_mean) and pd.notna(bottom_mean) else np.nan
+    top_mean + bottom_short_mean
+    if pd.notna(top_mean) and pd.notna(bottom_short_mean)
+    else np.nan
 )
 avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
 
@@ -979,8 +983,13 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     top = ready.nsmallest(k, "rank")  # rank 1..k
     bot = ready.nlargest(k, "rank")
     top_med = float(top["return_open_to_now"].median()) if not top.empty else np.nan
-    bot_med = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
-    l_s_med = top_med - bot_med if pd.notna(top_med) and pd.notna(bot_med) else np.nan
+    bot_med_raw = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
+    bot_med_short = -bot_med_raw if pd.notna(bot_med_raw) else np.nan
+    l_s_med = (
+        top_med + bot_med_short
+        if pd.notna(top_med) and pd.notna(bot_med_short)
+        else np.nan
+    )
     top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
     bot_win = float((bot["return_open_to_now"] < 0).mean()) if not bot.empty else np.nan
 
@@ -1015,8 +1024,13 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
         ("All ranks", "Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—", "↑ more positive"),
         ("All ranks", "≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—", "↑ more positive"),
         ("Long bucket", f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—", "↑ more positive"),
-        ("Short bucket", f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—", "↓ more negative"),
-        ("Spread", f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—", "↑ wider"),
+        (
+            "Short bucket",
+            f"Bottom-{k} median short P&L",
+            f"{bot_med_short*100:.2f}%" if pd.notna(bot_med_short) else "—",
+            "↑ more positive",
+        ),
+        ("Spread", f"Median long–short (Top-{k} + Short-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—", "↑ wider"),
         ("Long bucket", f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—", "↑ toward 100%"),
         ("Short bucket", f"Bottom-{k} win rate (<0%)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—", "↑ toward 100%"),
         ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—", "↑ toward 1"),
@@ -1196,8 +1210,8 @@ if not returns_ready_sorted.empty:
         )
     with summary_cols[2]:
         st.metric(
-            f"Bottom-{bottom_k_count or summary_bottomk} mean",
-            _fmt_pct_display(bottom_mean),
+            f"Bottom-{bottom_k_count or summary_bottomk} mean short P&L",
+            _fmt_pct_display(bottom_short_mean),
         )
     with summary_cols[3]:
         st.metric("Long–short spread", _fmt_pct_display(long_short_spread))
@@ -1211,7 +1225,7 @@ if not returns_ready_sorted.empty:
         )
     with rate_cols[1]:
         st.metric(
-            f"Bottom-{bottom_k_count or summary_bottomk} hit rate",
+            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate (<0%)",
             _fmt_pct_display(bottom_win_rate),
             delta=_fmt_delta_points(bottom_win_rate - 0.5) if pd.notna(bottom_win_rate) else None,
         )
@@ -1351,8 +1365,8 @@ with right:
             _fmt_pct_display(top_mean),
         )
         st.metric(
-            f"Bottom-{bottom_k_count or summary_bottomk} mean return",
-            _fmt_pct_display(bottom_mean),
+            f"Bottom-{bottom_k_count or summary_bottomk} mean short P&L",
+            _fmt_pct_display(bottom_short_mean),
         )
         st.metric("Long–short spread", _fmt_pct_display(long_short_spread))
         st.metric(
@@ -1360,7 +1374,7 @@ with right:
             _fmt_pct_display(top_win_rate),
         )
         st.metric(
-            f"Bottom-{bottom_k_count or summary_bottomk} hit rate",
+            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate (<0%)",
             _fmt_pct_display(bottom_win_rate),
         )
 
@@ -1413,8 +1427,9 @@ with met_left:
                 **Slope & bps/10 ranks** — positive values mean returns improve as rank gets better. Values near zero imply
                 little payoff for reordering; +10 bps per 10 ranks means a 10-place improvement is worth ~0.10%.
 
-                **Bucket medians & win rates** — long medians/win rates should trend positive and short medians should be
-                negative. A long–short spread above 0 and win rates above 55–60% are typical of a healthy day.
+                **Bucket medians & win rates** — long medians/win rates should trend positive and short medians translate
+                into positive short P&L (i.e., underlying returns negative). A long–short spread above 0 and win rates
+                above 55–60% are typical of a healthy day.
 
                 **Ranking scores (NDCG/MAP/Precision)** — all live in [0, 1]. Higher means more positive-return ideas surfaced
                 near the top. 0.5 is “coin flip” behaviour; >0.7 usually reflects strong signal for the current session.

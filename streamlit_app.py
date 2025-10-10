@@ -45,6 +45,7 @@ np, pd = _safe_import_pd_np()
 import pytz
 from dateutil import parser as dateparser
 import requests
+import altair as alt
 
 try:
     import websocket  # websocket-client
@@ -657,6 +658,20 @@ show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
 
+chart_data = (
+    df_view[["rank", "ticker", "prediction", "return_open_to_now"]]
+    .dropna(subset=["return_open_to_now"])
+    .copy()
+)
+if not chart_data.empty:
+    chart_data["return_direction"] = np.where(
+        chart_data["return_open_to_now"] >= 0,
+        "Positive",
+        "Negative",
+    )
+    chart_data.sort_values("rank", inplace=True)
+
+
 if price_mode == "live":
     open_label = "Open (today)"
     last_label = "Last price"
@@ -823,6 +838,14 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
 
 metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_tail_pct)
 
+deciles_chart_data = pd.DataFrame()
+if deciles_tbl is not None and not deciles_tbl.empty:
+    deciles_chart_data = deciles_tbl.copy()
+    decile_label = deciles_chart_data.columns[0]
+    deciles_chart_data = deciles_chart_data.rename(columns={decile_label: "rank_decile"})
+    deciles_chart_data["rank_decile"] = deciles_chart_data["rank_decile"].astype(str)
+
+
 # -----------------------
 # UI
 # -----------------------
@@ -876,6 +899,48 @@ with left:
     else:
         table_phrase = "returns (pending data)"
     st.subheader(f"Top predictions ({table_phrase})")
+    if not chart_data.empty:
+        scatter = (
+            alt.Chart(chart_data)
+            .mark_circle(size=70, opacity=0.75)
+            .encode(
+                x=alt.X("rank:Q", title="Model rank (1 = best)", scale=alt.Scale(zero=False)),
+                y=alt.Y(
+                    "return_open_to_now:Q",
+                    title="Realized return (open→now)",
+                    axis=alt.Axis(format="%"),
+                ),
+                color=alt.Color(
+                    "return_direction:N",
+                    title="Return direction",
+                    scale=alt.Scale(domain=["Positive", "Negative"], range=["#2ecc71", "#e74c3c"]),
+                ),
+                tooltip=[
+                    alt.Tooltip("ticker:N", title="Ticker"),
+                    alt.Tooltip("prediction:Q", title="Prediction", format=".4f"),
+                    alt.Tooltip("return_open_to_now:Q", title="Return", format=".2%"),
+                    alt.Tooltip("rank:Q", title="Rank"),
+                ],
+            )
+        )
+
+        rolling = (
+            alt.Chart(chart_data)
+            .transform_window(
+                rolling_mean="mean(return_open_to_now)",
+                sort=[{"field": "rank"}],
+                frame=[-5, 5],
+            )
+            .mark_line(color="#34495e", strokeWidth=2)
+            .encode(
+                x=alt.X("rank:Q"),
+                y=alt.Y("rolling_mean:Q", title="Rolling mean"),
+            )
+        )
+
+        st.altair_chart((scatter + rolling).interactive(), use_container_width=True)
+    else:
+        st.info("Waiting for realized returns to plot.")
     st.dataframe(show, use_container_width=True, height=650)
 
 with right:
@@ -932,6 +997,29 @@ with met_left:
 with met_right:
     st.subheader("Rank deciles → median returns")
     if not deciles_tbl.empty:
+        if not deciles_chart_data.empty:
+            decile_chart = (
+                alt.Chart(deciles_chart_data)
+                .mark_bar(color="#3498db", opacity=0.7)
+                .encode(
+                    x=alt.X("rank_decile:N", title="Rank decile"),
+                    y=alt.Y("median_return:Q", title="Median return", axis=alt.Axis(format="%")),
+                    tooltip=[
+                        alt.Tooltip("rank_decile:N", title="Decile"),
+                        alt.Tooltip("median_return:Q", title="Median return", format=".2%"),
+                        alt.Tooltip("count:Q", title="Count"),
+                    ],
+                )
+            )
+            decile_line = (
+                alt.Chart(deciles_chart_data)
+                .mark_line(color="#2c3e50", point=alt.OverlayMarkDef(filled=True, color="#2c3e50"))
+                .encode(
+                    x="rank_decile:N",
+                    y=alt.Y("median_return:Q", axis=alt.Axis(format="%")),
+                )
+            )
+            st.altair_chart(decile_chart + decile_line, use_container_width=True)
         # Format and show decile medians to visualize monotonicity
         deciles_fmt = deciles_tbl.copy()
         deciles_fmt["median_return"] = deciles_fmt["median_return"].apply(_fmt_pct)

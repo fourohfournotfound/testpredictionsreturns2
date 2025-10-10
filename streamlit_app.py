@@ -202,6 +202,25 @@ with st.sidebar:
         help="Clips bottom/top tails for metrics only. Spearman/Kendall are rank-based (already robust)."
     )
 
+    st.write("**Summary metrics (long vs short)**")
+    summary_topk_default = int(min(20, max(1, top_n)))
+    summary_topk = st.number_input(
+        "Top-K (long) rows",
+        min_value=1,
+        max_value=int(top_n),
+        value=summary_topk_default,
+        step=1,
+        help="Controls the Top-K slice used for summary metric cards.",
+    )
+    summary_bottomk = st.number_input(
+        "Bottom-K (short) rows",
+        min_value=1,
+        max_value=int(top_n),
+        value=summary_topk_default,
+        step=1,
+        help="Controls the Bottom-K slice (worst predictions among the visible set).",
+    )
+
 # -----------------------
 # Loaders / normalizers
 # -----------------------
@@ -864,8 +883,22 @@ with right:
     st.metric("Session date (ET)", str(session_date))
     st.metric("Symbols shown", f"{show.shape[0]:,}")
     if df_view["return_open_to_now"].notna().any():
-        realized_top_mean = df_view["return_open_to_now"].head(min(20, len(df_view))).mean()
-        st.metric("Mean return of Top-20", f"{realized_top_mean*100:.2f}%")
+        realized_scope = df_view[df_view["return_open_to_now"].notna()]
+        if not realized_scope.empty:
+            top_slice = realized_scope.head(min(int(summary_topk), len(realized_scope)))
+            bottom_slice = realized_scope.tail(min(int(summary_bottomk), len(realized_scope)))
+
+            top_mean = top_slice["return_open_to_now"].mean()
+            bottom_mean = bottom_slice["return_open_to_now"].mean()
+
+            st.metric(
+                f"Mean return of Top-{len(top_slice)}",
+                f"{top_mean * 100:.2f}%",
+            )
+            st.metric(
+                f"Mean return of Bottom-{len(bottom_slice)}",
+                f"{bottom_mean * 100:.2f}%",
+            )
 
     if price_mode == "live":
         total = len(symbols_eod)

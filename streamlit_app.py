@@ -9,9 +9,9 @@
 # - Auto-refresh UI; HTTP snapshot refresh cadence is configurable (default = never, to save quota)
 #
 # Docs used:
-# - Live v2 (US extended quotes): endpoint, s= batching, fields (open, lastTradePrice), 1 call / symbol.  (https://eodhd.com/api/us-quote-delayed)  [See EODHD docs page "Live v2 for US Stocks: Extended Quotes (2025)"]
-# - WebSockets: wss://ws.eodhistoricaldata.com/ws/us?api_token=..., subscribe/unsubscribe JSON; ~50 symbols/connection by default; WS does NOT consume API calls.
-# - API limits: daily calls counted per symbol, 100k/day default.
+# - Live v2 (US extended quotes): endpoint /api/us-quote-delayed, s= batching, fields (open, lastTradePrice), 1 call / ticker, page[limit]≤100.  [EODHD "Live v2 for US Stocks: Extended Quotes (2025)"]
+# - WebSockets: wss://ws.eodhistoricaldata.com/ws/us?api_token=..., subscribe/unsubscribe JSON; ~50 symbols/connection by default; WS does NOT consume API calls.  [EODHD "Real-Time Data API via WebSockets"]
+# - API limits: daily calls counted per symbol, 100k/day default.  [EODHD "API Limits"]
 # -----------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ BASE_HOST = "https://eodhd.com"
 LIVE_V2_URL = f"{BASE_HOST}/api/us-quote-delayed"   # US extended quotes (delayed); includes 'open' and 'lastTradePrice'
 
 HTTP_BATCH = 100           # Live v2: page[limit] max 100
-DEFAULT_WS_WINDOW = 50     # per EODHD docs: 50 concurrent symbols per connection by default
+DEFAULT_WS_WINDOW = 50     # per EODHD docs: ~50 concurrent symbols per connection by default
 DEFAULT_WS_DWELL = 2       # seconds to sit on each WS rotation slice
 CACHE_TTL_LIVEV2 = 60 * 60 * 6   # 6h; 'open' is fixed after regular open, lastTradePrice is WS-overridden
 
@@ -126,6 +126,30 @@ with st.sidebar:
     today_ny = datetime.now(tz=NY).date()
     session_date = st.date_input("Target trading session (ET)", value=today_ny)
 
+    # Price sourcing
+    st.write("**Price data source**")
+    price_source = st.selectbox(
+        "Where should OHLC prices come from?",
+        (
+            "Auto (live today, historical API otherwise)",
+            "Force live (today only)",
+            "Historical via EODHD API",
+            "Upload daily OHLCV",
+        ),
+        help=(
+            "Auto = live quotes when the session matches today, otherwise daily bars via the EODHD EOD API. "
+            "Upload lets you provide your own daily OHLCV file (MultiIndex CSV supported)."
+        ),
+    )
+
+    uploaded_ohlcv_file = None
+    if price_source == "Upload daily OHLCV":
+        uploaded_ohlcv_file = st.file_uploader(
+            "Upload daily OHLCV (CSV)",
+            type=["csv"],
+            help="Expect columns like ticker/date/open/close. MultiIndex CSVs are also supported.",
+        )
+
     # Symbol format
     st.write("**Symbol format**")
     exchange_suffix = st.text_input(
@@ -160,6 +184,41 @@ with st.sidebar:
         "Refresh Live v2 HTTP snapshot every N minutes (0 = never, save quota)",
         min_value=0, max_value=120, value=0, step=5,
         help="Live v2 costs 1 API call per ticker (batched). Keep 0 to avoid burning calls."
+    )
+
+    # --- NEW: robust evaluation controls (metrics only; no API calls) ---
+    st.write("**Evaluation metrics (robust)**")
+    metrics_topk = st.slider(
+        "Top-K for metrics (used for medians & win rate)",
+        min_value=5,
+        max_value=int(min(200, max(5, top_n))),
+        value=int(min(20, top_n)),
+        step=5,
+        help="Applies to Top/Bottom median returns and Top-K win rate."
+    )
+    winsor_tail_pct = st.slider(
+        "Winsorize tails of 'return_open_to_now' (%) for metrics",
+        min_value=0, max_value=10, value=1, step=1,
+        help="Clips bottom/top tails for metrics only. Spearman/Kendall are rank-based (already robust)."
+    )
+
+    st.write("**Summary metrics (long vs short)**")
+    summary_topk_default = int(min(20, max(1, top_n)))
+    summary_topk = st.number_input(
+        "Top-K (long) rows",
+        min_value=1,
+        max_value=int(top_n),
+        value=summary_topk_default,
+        step=1,
+        help="Controls the Top-K slice used for summary metric cards.",
+    )
+    summary_bottomk = st.number_input(
+        "Bottom-K (short) rows",
+        min_value=1,
+        max_value=int(top_n),
+        value=summary_topk_default,
+        step=1,
+        help="Controls the Bottom-K slice (worst predictions among the visible set).",
     )
 
 # -----------------------
@@ -212,6 +271,45 @@ def _load_predictions_from_path(path: str) -> pd.DataFrame:
 def _load_predictions_from_upload(upload: io.BytesIO) -> pd.DataFrame:
     return _normalize_predictions(pd.read_csv(upload))
 
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OHLCV daily bars (ticker/date/open/close at minimum)."""
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
+
+    cols = {c.lower().strip(): c for c in df.columns}
+    ticker_col = next((cols[k] for k in cols if k in ["ticker", "symbol"]), None)
+    date_col = next((cols[k] for k in cols if k in ["date", "session_date", "day"]), None)
+    open_col = next((cols[k] for k in cols if k in ["open", "open_price", "o"]), None)
+    close_col = next((cols[k] for k in cols if k in ["close", "close_price", "c", "last"]), None)
+
+    missing = []
+    if ticker_col is None: missing.append("ticker")
+    if date_col is None:   missing.append("date")
+    if open_col is None:   missing.append("open")
+    if close_col is None:  missing.append("close")
+    if missing:
+        st.error("OHLCV file missing required column(s): " + ", ".join(missing))
+        st.stop()
+
+    out = df.rename(columns={
+        ticker_col: "ticker",
+        date_col: "date",
+        open_col: "open",
+        close_col: "close",
+    })
+
+    out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
+    out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.date
+    numeric_cols = [c for c in ["open", "close", "adj_close"] if c in out.columns]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    keep_cols = [c for c in ["ticker", "date", "open", "close", "adj_close", "high", "low", "volume"] if c in out.columns]
+    return out[keep_cols]
+
+def _load_ohlcv_from_upload(upload: io.BytesIO) -> pd.DataFrame:
+    return _normalize_ohlcv(pd.read_csv(upload))
+
 def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFrame:
     out = df.copy()
     if "date" in out.columns:
@@ -257,6 +355,37 @@ def _strip_suffix(symbol: str) -> str:
 def _chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _historical_daily_bars(symbols_eod: Tuple[str, ...], session: date) -> pd.DataFrame:
+    """Fetch historical daily bars (open/close) for a single session via EODHD EOD API."""
+    if not symbols_eod:
+        return pd.DataFrame(columns=["symbol", "open", "close"]).set_index("symbol")
+
+    iso = session.strftime("%Y-%m-%d")
+    frames = []
+    for sym in symbols_eod:
+        url = f"{BASE_HOST}/api/eod/{sym}?from={iso}&to={iso}&api_token={API_TOKEN}&fmt=json"
+        try:
+            r = _http.get(url, timeout=10)
+            if not r.ok:
+                continue
+            payload = r.json()
+            if isinstance(payload, list) and payload:
+                bar = payload[0]
+                frames.append({
+                    "symbol": sym,
+                    "open": bar.get("open", np.nan),
+                    "close": bar.get("close", np.nan),
+                })
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "open", "close"]).set_index("symbol")
+
+    out = pd.DataFrame(frames).drop_duplicates(subset=["symbol"]).set_index("symbol")
+    return out
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_LIVEV2)
 def _livev2_quotes_once(symbols_eod: Tuple[str, ...]) -> pd.DataFrame:
@@ -388,6 +517,7 @@ preds = _align_and_filter_for_session(preds, session_date)
 preds_ranked = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
 preds_ranked["rank"] = np.arange(1, len(preds_ranked) + 1)
 preds_ranked = preds_ranked.head(int(top_n))
+preds_ranked["ticker"] = preds_ranked["ticker"].astype(str).str.upper().str.strip()
 st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 
 # Session guard
@@ -401,57 +531,109 @@ symbols_in = preds_ranked["ticker"].dropna().astype(str).str.upper().tolist()
 symbols_eod = [_to_eod_symbol(t, exchange_suffix) for t in symbols_in]
 symbols_eod_tuple = tuple(symbols_eod)  # for cache key stability
 
-# -----------------------
-# HTTP snapshot (opens + initial last)
-# -----------------------
-# One-time (cached) snapshot
-quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)  # index: EOD symbol
-# Optional periodic refresh to gently correct drift if desired
-if _should_http_refresh():
-    quotes_snapshot = _livev2_quotes_once.clear() and _livev2_quotes_once(symbols_eod_tuple)  # invalidate + refetch
-    _mark_http_refreshed()
+is_today_session = session_date == today_ny
+is_past_session = session_date < today_ny
+
+if price_source == "Force live (today only)":
+    price_mode = "live"
+elif price_source == "Historical via EODHD API":
+    price_mode = "historical_api"
+elif price_source == "Upload daily OHLCV":
+    price_mode = "upload"
+else:
+    price_mode = "live" if is_today_session else ("historical_api" if is_past_session else "future")
+
+if price_mode == "live" and not is_today_session:
+    st.warning("Live mode only supports today's session — falling back to historical daily bars.")
+    price_mode = "historical_api"
+
+ohlcv_upload_df = None
+if price_mode == "upload":
+    if uploaded_ohlcv_file is None:
+        st.info("Upload a daily OHLCV CSV to evaluate past sessions without API calls.")
+        st.stop()
+    ohlcv_upload_df = _load_ohlcv_from_upload(uploaded_ohlcv_file)
+    st.caption(f"📐 Uploaded OHLCV shape after normalization: {ohlcv_upload_df.shape}")
 
 # -----------------------
-# Last-price cache persisted across refreshes
+# Price data assembly (live vs historical vs upload)
 # -----------------------
-if "last_price_cache" not in st.session_state:
-    st.session_state["last_price_cache"] = {}
-
-# Seed cache from snapshot for any missing symbols
-for sym in symbols_eod:
-    if sym not in st.session_state["last_price_cache"]:
-        try:
-            st.session_state["last_price_cache"][sym] = float(quotes_snapshot.at[sym, "lastTradePrice"])
-        except Exception:
-            pass
-
-# -----------------------
-# Rotating WS update (optional)
-# -----------------------
-if ws_enabled:
-    if not _HAS_WS:
-        st.info("websocket-client not installed; staying on delayed HTTP only.")
-    else:
-        rot = st.session_state.get("ws_rot_idx", 0)
-        ws_prices = _ws_update_prices_rotating(ws_url, symbols_eod, min(ws_window, DEFAULT_WS_WINDOW), ws_dwell, rot)
-        # Update cache with any fresh prints from this slice
-        for sym, px in ws_prices.items():
-            st.session_state["last_price_cache"][sym] = px
-        st.session_state["ws_rot_idx"] = rot + 1
-
-# -----------------------
-# Build view: open from HTTP snapshot; last price from cache (or snapshot fallback)
-# -----------------------
-open_series = quotes_snapshot["open"] if "open" in quotes_snapshot.columns else pd.Series(dtype=float)
-last_series = pd.Series({s: st.session_state["last_price_cache"].get(s, np.nan) for s in symbols_eod}, dtype=float)
-
 map_df = pd.DataFrame({"ticker": symbols_in, "eod_symbol": symbols_eod}).drop_duplicates()
+map_df["base_ticker"] = map_df["ticker"].str.upper().str.strip()
 df_view = preds_ranked.merge(map_df, on="ticker", how="left")
-df_view = df_view.merge(open_series.rename("open_today"), left_on="eod_symbol", right_index=True, how="left")
-df_view = df_view.merge(last_series.rename("last_price"), left_on="eod_symbol", right_index=True, how="left")
+if "base_ticker" in df_view.columns:
+    df_view["base_ticker"] = df_view["base_ticker"].fillna(df_view["ticker"].astype(str).str.upper().str.strip())
+else:
+    df_view["base_ticker"] = df_view["ticker"].astype(str).str.upper().str.strip()
+
+df_view["open_today"] = np.nan
+df_view["last_price"] = np.nan
+
+quotes_snapshot = None
+hist = None
+session_rows_all = None
+session_rows = None
+
+if price_mode == "live":
+    quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)  # index: EOD symbol
+    if _should_http_refresh():
+        _livev2_quotes_once.clear()
+        quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)
+        _mark_http_refreshed()
+
+    if "last_price_cache" not in st.session_state:
+        st.session_state["last_price_cache"] = {}
+
+    for sym in symbols_eod:
+        if sym not in st.session_state["last_price_cache"]:
+            try:
+                st.session_state["last_price_cache"][sym] = float(quotes_snapshot.at[sym, "lastTradePrice"])
+            except Exception:
+                pass
+
+    if ws_enabled:
+        if not _HAS_WS:
+            st.info("websocket-client not installed; staying on delayed HTTP only.")
+        else:
+            rot = st.session_state.get("ws_rot_idx", 0)
+            ws_prices = _ws_update_prices_rotating(ws_url, symbols_eod, min(ws_window, DEFAULT_WS_WINDOW), ws_dwell, rot)
+            for sym, px in ws_prices.items():
+                st.session_state["last_price_cache"][sym] = px
+            st.session_state["ws_rot_idx"] = rot + 1
+
+    open_series = quotes_snapshot["open"] if "open" in quotes_snapshot.columns else pd.Series(dtype=float)
+    last_series = pd.Series({s: st.session_state["last_price_cache"].get(s, np.nan) for s in symbols_eod}, dtype=float)
+    df_view["open_today"] = df_view["eod_symbol"].map(open_series)
+    df_view["last_price"] = df_view["eod_symbol"].map(last_series)
+
+elif price_mode == "historical_api":
+    hist = _historical_daily_bars(symbols_eod_tuple, session_date)
+    st.caption(f"📐 Historical EOD bars fetched: {hist.shape}")
+    if hist.empty:
+        st.warning("No historical bars returned for this session from EODHD.")
+    df_view["open_today"] = df_view["eod_symbol"].map(hist["open"] if "open" in hist.columns else pd.Series(dtype=float))
+    df_view["last_price"] = df_view["eod_symbol"].map(hist["close"] if "close" in hist.columns else pd.Series(dtype=float))
+
+elif price_mode == "upload":
+    session_rows_all = ohlcv_upload_df[ohlcv_upload_df["date"] == session_date]
+    st.caption(f"📐 Uploaded OHLCV rows for {session_date}: {session_rows_all.shape}")
+    if session_rows_all.empty:
+        st.warning("Uploaded OHLCV file has no rows for this session date.")
+    session_rows = session_rows_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
+    df_view["open_today"] = df_view["base_ticker"].map(session_rows["open"] if "open" in session_rows.columns else pd.Series(dtype=float))
+    close_col = "close" if "close" in session_rows.columns else None
+    if close_col is None and "adj_close" in session_rows.columns:
+        close_col = "adj_close"
+    if close_col is None:
+        st.error("Uploaded OHLCV file needs a 'close' or 'adj_close' column for returns.")
+        st.stop()
+    df_view["last_price"] = df_view["base_ticker"].map(session_rows[close_col])
+
+else:  # future session
+    st.info("Selected session is in the future. Returns will populate once data is available.")
 
 # Compute open→now return (suppress before regular open)
-if now_et < session_open:
+if price_mode == "live" and now_et < session_open:
     df_view["return_open_to_now"] = np.nan
 else:
     df_view["return_open_to_now"] = (df_view["last_price"] / df_view["open_today"] - 1.0).replace([np.inf, -np.inf], np.nan)
@@ -475,18 +657,225 @@ show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
 
+if price_mode == "live":
+    open_label = "Open (today)"
+    last_label = "Last price"
+    return_label = "Return (open→now)"
+elif price_mode in {"historical_api", "upload"}:
+    open_label = "Open"
+    last_label = "Close"
+    return_label = "Return (open→close)"
+else:
+    open_label = "Open"
+    last_label = "Last price"
+    return_label = "Return"
+
+show = show.rename(columns={
+    "open_today": open_label,
+    "last_price": last_label,
+    "return_open_to_now": return_label,
+})
+
+# -----------------------
+# NEW: Robust rank⇄return metrics (no API calls; in-memory)
+# -----------------------
+def _winsorize_series(s: pd.Series, p: float) -> pd.Series:
+    """Clip s to [p, 1-p] quantiles; p in [0, 0.5)."""
+    s = pd.to_numeric(s, errors="coerce")
+    if p <= 0 or s.dropna().empty:
+        return s
+    lo, hi = s.quantile([p, 1 - p])
+    return s.clip(lower=lo, upper=hi)
+
+def _pearson_corr(a: pd.Series, b: pd.Series) -> float:
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    m = a.notna() & b.notna()
+    if m.sum() < 2:
+        return np.nan
+    ax = a[m] - a[m].mean()
+    bx = b[m] - b[m].mean()
+    denom = np.sqrt((ax**2).sum() * (bx**2).sum())
+    return float((ax * bx).sum() / denom) if denom > 0 else np.nan
+
+def _spearman_corr(a: pd.Series, b: pd.Series) -> float:
+    """Spearman via Pearson of ranks (average-tie method)."""
+    ar = a.rank(method="average")
+    br = b.rank(method="average")
+    return _pearson_corr(ar, br)
+
+def _kendall_tau_b(x: pd.Series, y: pd.Series) -> float:
+    """Naive O(n^2) Kendall tau-b; fine for typical top-N≤~1000."""
+    d = pd.DataFrame({"x": pd.to_numeric(x, errors="coerce"),
+                      "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    n = len(d)
+    if n < 2:
+        return np.nan
+    xv = d["x"].to_numpy()
+    yv = d["y"].to_numpy()
+    C = 0  # concordant
+    D = 0  # discordant
+    for i in range(n - 1):
+        dx = xv[i+1:] - xv[i]
+        dy = yv[i+1:] - yv[i]
+        prod = dx * dy
+        C += int((prod > 0).sum())
+        D += int((prod < 0).sum())
+    # tie corrections
+    n0 = n * (n - 1) // 2
+    counts_x = pd.Series(xv).value_counts().to_numpy()
+    counts_y = pd.Series(yv).value_counts().to_numpy()
+    n1 = int(((counts_x * (counts_x - 1)) // 2).sum())
+    n2 = int(((counts_y * (counts_y - 1)) // 2).sum())
+    denom = np.sqrt((n0 - n1) * (n0 - n2))
+    return float((C - D) / denom) if denom > 0 else np.nan
+
+def _theil_sen_slope_via_deciles(x: pd.Series, y: pd.Series, bins: int = 10) -> float:
+    """
+    Robust Theil–Sen slope of y vs x computed on decile medians to avoid O(n^2).
+    Returns slope only. If insufficient points, returns np.nan.
+    """
+    d = pd.DataFrame({"x": pd.to_numeric(x, errors="coerce"),
+                      "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    if d.shape[0] < 3:
+        return np.nan
+    bins = int(max(3, min(bins, d.shape[0] // 2)))
+    # bin by rank to evenly spread observations
+    # labels 1..bins with 1 = lowest x; we want x increasing with "better", so we will pass x as (-rank)
+    try:
+        q = pd.qcut(d["x"].rank(method="first"), q=bins, labels=False, duplicates="drop")
+    except Exception:
+        q = pd.cut(d["x"], bins=bins, labels=False, duplicates="drop")
+    g = d.assign(bin=q).groupby("bin", as_index=False).agg(x_med=("x", "median"), y_med=("y", "median")).dropna()
+    xv = g["x_med"].to_numpy()
+    yv = g["y_med"].to_numpy()
+    m = len(xv)
+    if m < 3:
+        return np.nan
+    slopes = []
+    for i in range(m - 1):
+        dx = xv[i+1:] - xv[i]
+        dy = yv[i+1:] - yv[i]
+        valid = dx != 0
+        if np.any(valid):
+            slopes.extend((dy[valid] / dx[valid]).tolist())
+    return float(np.median(slopes)) if slopes else np.nan
+
+def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute robust rank↔return metrics; returns (metrics_table, deciles_table)."""
+    ready = df[["rank", "prediction", "return_open_to_now"]].dropna().copy()
+    st.caption(f"📐 Metrics-ready rows (after NA drop): {ready.shape}")
+
+    if ready.empty:
+        return pd.DataFrame(columns=["metric", "value"]), pd.DataFrame(columns=["decile", "median_return"])
+
+    # Use negative rank so "higher is better" for correlation orientation
+    ready["neg_rank"] = -ready["rank"].astype(float)
+
+    # Winsorize returns for Pearson-style only (Spearman/Kendall are rank-based)
+    p = max(0.0, min(0.5, float(winsor_pct) / 100.0))
+    ret_w = _winsorize_series(ready["return_open_to_now"], p)
+
+    # Correlations
+    spearman = _spearman_corr(ready["neg_rank"], ready["return_open_to_now"])
+    kendall  = _kendall_tau_b(ready["neg_rank"], ready["return_open_to_now"])
+    pearson_w = _pearson_corr(ready["neg_rank"], ret_w)
+
+    # Theil–Sen slope (robust): y vs x where x = -rank
+    ts_slope = _theil_sen_slope_via_deciles(ready["neg_rank"], ready["return_open_to_now"], bins=10)
+    bps_per_10rank = (ts_slope * 10.0) * 10000.0 if pd.notna(ts_slope) else np.nan
+
+    # Top/Bottom-K medians + win rate
+    k = int(min(topk, ready.shape[0] // 2 if ready.shape[0] >= 2 else topk))
+    top = ready.nsmallest(k, "rank")  # rank 1..k
+    bot = ready.nlargest(k, "rank")
+    top_med = float(top["return_open_to_now"].median()) if not top.empty else np.nan
+    bot_med = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
+    l_s_med = top_med - bot_med if pd.notna(top_med) and pd.notna(bot_med) else np.nan
+    top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
+
+    metrics_rows = [
+        ("Spearman ρ (−rank vs return)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
+        ("Kendall τ-b (−rank vs return)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
+        (f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—"),
+        ("Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—"),
+        ("≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—"),
+        (f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—"),
+        (f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—"),
+        (f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
+        (f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
+    ]
+    metrics_tbl = pd.DataFrame(metrics_rows, columns=["metric", "value"])
+
+    # Deciles by rank: 1 (best) → D (worst)
+    D = int(min(10, max(3, ready.shape[0] // 10)))
+    ready["decile"] = pd.qcut(ready["rank"], q=D, labels=False, duplicates="drop") if ready["rank"].nunique() > 1 else 0
+    # make 0 = best rank bucket
+    deciles = (ready
+               .groupby("decile", as_index=False)
+               .agg(median_return=("return_open_to_now", "median"),
+                    count=("return_open_to_now", "size"))
+               .sort_values("decile"))
+    deciles["bucket"] = deciles["decile"].astype(int) + 1  # 1..D
+    deciles = deciles[["bucket", "count", "median_return"]]
+    deciles.rename(columns={"bucket": f"rank_decile(1=best, D={deciles.shape[0]})"}, inplace=True)
+    return metrics_tbl, deciles
+
+metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_tail_pct)
+
 # -----------------------
 # UI
 # -----------------------
+
+price_mode_label_map = {
+    "live": "HTTP + rotating WS" if ws_enabled else "HTTP (delayed only)",
+    "historical_api": "Historical daily bars (EODHD API)",
+    "upload": "Uploaded OHLCV file",
+    "future": "Future session (awaiting data)",
+}
+price_mode_label = price_mode_label_map.get(price_mode, str(price_mode))
+
+price_dim_lines = [
+    f"predictions_raw: {preds.shape}",
+    f"ranked_topN:     {preds_ranked.shape}",
+]
+
+if price_mode == "live":
+    snap_shape = quotes_snapshot.shape if isinstance(quotes_snapshot, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"quotes_snapshot: {snap_shape}")
+elif price_mode == "historical_api":
+    hist_shape = hist.shape if isinstance(hist, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"historical_bars: {hist_shape}")
+elif price_mode == "upload":
+    upload_shape = session_rows_all.shape if isinstance(session_rows_all, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"uploaded_rows: {upload_shape}")
+else:
+    price_dim_lines.append("price_data: future (n/a)")
+
+price_dim_lines.extend([
+    f"joined_view:     {df_view.shape}",
+    f"mode:            {price_mode_label}",
+])
 st.title("📈 Live LTR Monitor — Predictions vs Open→Now Returns (EODHD, rotating WS)")
 st.caption(
     "Opens fetched once via **Live v2 (delayed)**; last prices updated by **rotating WebSocket slices** "
     f"(chunk ≤{DEFAULT_WS_WINDOW}). This keeps HTTP API calls low while still refreshing a large watchlist."
 )
 
+if price_mode in {"historical_api", "upload"}:
+    st.caption("Historical mode: returns use session open → close (no WebSocket refresh required).")
+elif price_mode == "future":
+    st.caption("Future session selected — waiting for market data to arrive.")
+
 left, right = st.columns([3, 2], gap="large")
 with left:
-    st.subheader("Top predictions (returns from open → latest)")
+    if price_mode == "live":
+        table_phrase = "returns from open → latest"
+    elif price_mode in {"historical_api", "upload"}:
+        table_phrase = "returns from open → close"
+    else:
+        table_phrase = "returns (pending data)"
+    st.subheader(f"Top predictions ({table_phrase})")
     st.dataframe(show, use_container_width=True, height=650)
 
 with right:
@@ -494,34 +883,61 @@ with right:
     st.metric("Session date (ET)", str(session_date))
     st.metric("Symbols shown", f"{show.shape[0]:,}")
     if df_view["return_open_to_now"].notna().any():
-        realized_top_mean = df_view["return_open_to_now"].head(min(20, len(df_view))).mean()
-        st.metric("Mean return of Top-20", f"{realized_top_mean*100:.2f}%")
+        realized_scope = df_view[df_view["return_open_to_now"].notna()]
+        if not realized_scope.empty:
+            top_slice = realized_scope.head(min(int(summary_topk), len(realized_scope)))
+            bottom_slice = realized_scope.tail(min(int(summary_bottomk), len(realized_scope)))
 
-    # Rotation diagnostics
-    total = len(symbols_eod)
-    rot = st.session_state.get("ws_rot_idx", 0)
-    current_slice_start = (rot * min(ws_window, DEFAULT_WS_WINDOW)) % max(total, 1) if total else 0
-    st.write(" ")
-    st.write("**Rotation status**")
-    st.code(
-        f"total_symbols:    {total}\n"
-        f"ws_chunk_size:    {min(ws_window, DEFAULT_WS_WINDOW)}\n"
-        f"ws_dwell_seconds: {ws_dwell}\n"
-        f"rotation_index:   {rot}\n"
-        f"slice_start_idx:  {current_slice_start}",
-        language="text",
-    )
+            top_mean = top_slice["return_open_to_now"].mean()
+            bottom_mean = bottom_slice["return_open_to_now"].mean()
+
+            st.metric(
+                f"Mean return of Top-{len(top_slice)}",
+                f"{top_mean * 100:.2f}%",
+            )
+            st.metric(
+                f"Mean return of Bottom-{len(bottom_slice)}",
+                f"{bottom_mean * 100:.2f}%",
+            )
+
+    if price_mode == "live":
+        total = len(symbols_eod)
+        rot = st.session_state.get("ws_rot_idx", 0)
+        current_slice_start = (rot * min(ws_window, DEFAULT_WS_WINDOW)) % max(total, 1) if total else 0
+        st.write(" ")
+        st.write("**Rotation status**")
+        st.code(
+            f"total_symbols:    {total}\n"
+            f"ws_chunk_size:    {min(ws_window, DEFAULT_WS_WINDOW)}\n"
+            f"ws_dwell_seconds: {ws_dwell}\n"
+            f"rotation_index:   {rot}\n"
+            f"slice_start_idx:  {current_slice_start}",
+            language="text",
+        )
 
     st.write(" ")
     st.write("**Dimensions audit**")
-    st.code(
-        f"predictions_raw: {preds.shape}\n"
-        f"ranked_topN:     {preds_ranked.shape}\n"
-        f"quotes_snapshot: {quotes_snapshot.shape}\n"
-        f"joined_view:     {df_view.shape}\n"
-        f"mode:            {'HTTP + rotating WS' if ws_enabled else 'HTTP (delayed only)'}",
-        language="text",
-    )
+    st.code("\n".join(price_dim_lines), language="text")
+
+st.write("---")
+met_left, met_right = st.columns([2, 3], gap="large")
+with met_left:
+    metrics_scope = "today" if price_mode == "live" and is_today_session else str(session_date)
+    st.subheader(f"🧪 Robust rank⇄return metrics ({metrics_scope})")
+    if not metrics_tbl.empty:
+        st.dataframe(metrics_tbl, use_container_width=True, height=330)
+    else:
+        st.info("Metrics unavailable (no non-NA returns yet).")
+
+with met_right:
+    st.subheader("Rank deciles → median returns")
+    if not deciles_tbl.empty:
+        # Format and show decile medians to visualize monotonicity
+        deciles_fmt = deciles_tbl.copy()
+        deciles_fmt["median_return"] = deciles_fmt["median_return"].apply(_fmt_pct)
+        st.dataframe(deciles_fmt, use_container_width=True, height=330)
+    else:
+        st.info("Decile table unavailable (insufficient rows).")
 
 # Download
 csv_buf = io.StringIO()
@@ -533,7 +949,8 @@ st.download_button(
     mime="text/csv",
 )
 
-st.caption(
-    "Tip: Keep HTTP refresh at **0 minutes** when monitoring large lists to avoid burning daily API calls. "
-    "WebSockets don’t consume API calls; default WS limit is ~50 symbols per connection (upgradeable)."
-)
+if price_mode == "live":
+    st.caption(
+        "Tip: Keep HTTP refresh at **0 minutes** when monitoring large lists to avoid burning daily API calls. "
+        "WebSockets don’t consume API calls; default WS limit is ~50 symbols per connection (upgradeable)."
+    )

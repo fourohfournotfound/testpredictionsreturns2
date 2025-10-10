@@ -766,11 +766,13 @@ top_mean = float(top_slice["return_open_to_now"].mean()) if not top_slice.empty 
 bottom_short_mean = (
     float((-bottom_slice["return_open_to_now"]).mean()) if not bottom_slice.empty else np.nan
 )
-long_short_spread = (
-    top_mean + bottom_short_mean
-    if pd.notna(top_mean) and pd.notna(bottom_short_mean)
-    else np.nan
-)
+if not top_slice.empty and not bottom_slice.empty:
+    long_leg_sum = float(top_slice["return_open_to_now"].sum())
+    short_leg_sum = float((-bottom_slice["return_open_to_now"]).sum())
+    total_positions = top_slice.shape[0] + bottom_slice.shape[0]
+    long_short_spread = (long_leg_sum + short_leg_sum) / total_positions if total_positions else np.nan
+else:
+    long_short_spread = np.nan
 avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
 
 top_win_rate = float((top_slice["return_open_to_now"] > 0).mean()) if not top_slice.empty else np.nan
@@ -795,7 +797,9 @@ if not returns_ready_sorted.empty:
     short_curve["hit_rate"] = (short_curve["return_open_to_now"] < 0).expanding().mean()
 
     short_curve["short_mean_pnl"] = -short_curve["mean_return"]
-    long_short_spread_curve = long_curve["mean_return"].values - short_curve["mean_return"].values
+    long_short_spread_curve = 0.5 * (
+        long_curve["mean_return"].values + short_curve["short_mean_pnl"].values
+    )
 
     topk_depth_returns = pd.concat(
         [
@@ -816,7 +820,7 @@ if not returns_ready_sorted.empty:
             pd.DataFrame(
                 {
                     "top_k": long_curve["top_k"],
-                    "series": "Long–short spread (avg)",
+                    "series": "Equal-weight long–short spread (avg)",
                     "value": long_short_spread_curve,
                 }
             ),
@@ -1214,7 +1218,7 @@ if not returns_ready_sorted.empty:
             _fmt_pct_display(bottom_short_mean),
         )
     with summary_cols[3]:
-        st.metric("Long–short spread", _fmt_pct_display(long_short_spread))
+        st.metric("Equal-weight long–short spread", _fmt_pct_display(long_short_spread))
 
     rate_cols = st.columns(2, gap="large")
     with rate_cols[0]:
@@ -1255,7 +1259,7 @@ with left:
                         domain=[
                             "Long cumulative avg return",
                             "Short cumulative avg return (short P&L)",
-                            "Long–short spread (avg)",
+                            "Equal-weight long–short spread (avg)",
                         ],
                         range=["#1abc9c", "#e67e22", "#f1c40f"],
                     ),
@@ -1368,7 +1372,7 @@ with right:
             f"Bottom-{bottom_k_count or summary_bottomk} mean short P&L",
             _fmt_pct_display(bottom_short_mean),
         )
-        st.metric("Long–short spread", _fmt_pct_display(long_short_spread))
+        st.metric("Equal-weight long–short spread", _fmt_pct_display(long_short_spread))
         st.metric(
             f"Top-{top_k_count or summary_topk} hit rate",
             _fmt_pct_display(top_win_rate),

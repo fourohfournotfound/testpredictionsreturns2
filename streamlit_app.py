@@ -713,6 +713,12 @@ def _fmt_delta(x):
         return ""
     return f"{int(x):+d}"
 
+def _fmt_pct_display(x: float) -> str:
+    return "—" if pd.isna(x) else f"{x * 100:.2f}%"
+
+def _fmt_delta_points(x: float) -> str:
+    return "" if pd.isna(x) else f"{x * 100:.1f} pts"
+
 display_cols = [
     "rank",
     "baseline_rank",
@@ -745,6 +751,48 @@ if not chart_data.empty:
         "Negative",
     )
     chart_data.sort_values("rank", inplace=True)
+
+
+returns_ready = df_view[df_view["return_open_to_now"].notna()].copy()
+returns_ready_sorted = returns_ready.sort_values("rank") if not returns_ready.empty else returns_ready
+
+top_k_count = int(min(int(summary_topk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
+bottom_k_count = int(min(int(summary_bottomk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
+
+top_slice = returns_ready_sorted.head(top_k_count) if top_k_count else pd.DataFrame(columns=returns_ready.columns)
+bottom_slice = returns_ready_sorted.tail(bottom_k_count) if bottom_k_count else pd.DataFrame(columns=returns_ready.columns)
+
+top_mean = float(top_slice["return_open_to_now"].mean()) if not top_slice.empty else np.nan
+bottom_mean = float(bottom_slice["return_open_to_now"].mean()) if not bottom_slice.empty else np.nan
+long_short_spread = (
+    top_mean - bottom_mean if pd.notna(top_mean) and pd.notna(bottom_mean) else np.nan
+)
+avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
+
+top_win_rate = float((top_slice["return_open_to_now"] > 0).mean()) if not top_slice.empty else np.nan
+bottom_win_rate = float((bottom_slice["return_open_to_now"] < 0).mean()) if not bottom_slice.empty else np.nan
+
+cumulative_chart_long = pd.DataFrame()
+if not returns_ready_sorted.empty:
+    cumulative_chart_data = returns_ready_sorted[["rank", "return_open_to_now"]].copy()
+    cumulative_chart_data.sort_values("rank", inplace=True)
+    cumulative_chart_data["top_k"] = np.arange(1, len(cumulative_chart_data) + 1)
+    cumulative_chart_data["top_k_mean_return"] = (
+        cumulative_chart_data["return_open_to_now"].expanding().mean()
+    )
+    cumulative_chart_data["top_k_hit_rate"] = (
+        (cumulative_chart_data["return_open_to_now"] > 0).expanding().mean()
+    )
+    cumulative_chart_long = (
+        cumulative_chart_data[["top_k", "top_k_mean_return", "top_k_hit_rate"]]
+        .rename(
+            columns={
+                "top_k_mean_return": "Top-K average return",
+                "top_k_hit_rate": "Top-K hit rate (share > 0)",
+            }
+        )
+        .melt("top_k", var_name="metric", value_name="value")
+    )
 
 
 if price_mode == "live":
@@ -1090,15 +1138,80 @@ if price_mode in {"historical_api", "upload"}:
 elif price_mode == "future":
     st.caption("Future session selected — waiting for market data to arrive.")
 
+if not returns_ready_sorted.empty:
+    st.subheader("🚦 Performance snapshot")
+    summary_cols = st.columns(4, gap="large")
+    with summary_cols[0]:
+        st.metric("Avg return (all ranked)", _fmt_pct_display(avg_return_all))
+    with summary_cols[1]:
+        st.metric(
+            f"Top-{top_k_count or summary_topk} mean",
+            _fmt_pct_display(top_mean),
+        )
+    with summary_cols[2]:
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} mean",
+            _fmt_pct_display(bottom_mean),
+        )
+    with summary_cols[3]:
+        st.metric("Long–short spread", _fmt_pct_display(long_short_spread))
+
+    rate_cols = st.columns(2, gap="large")
+    with rate_cols[0]:
+        st.metric(
+            f"Top-{top_k_count or summary_topk} hit rate",
+            _fmt_pct_display(top_win_rate),
+            delta=_fmt_delta_points(top_win_rate - 0.5) if pd.notna(top_win_rate) else None,
+        )
+    with rate_cols[1]:
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} hit rate",
+            _fmt_pct_display(bottom_win_rate),
+            delta=_fmt_delta_points(bottom_win_rate - 0.5) if pd.notna(bottom_win_rate) else None,
+        )
+
 left, right = st.columns([3, 2], gap="large")
 with left:
+    st.subheader("Top-K depth curve")
+    st.caption(
+        "Shows the cross-sectional average return and hit rate as you include more of today's ranked ideas."
+    )
+    if not cumulative_chart_long.empty:
+        cumulative_chart = (
+            alt.Chart(cumulative_chart_long)
+            .mark_line(point=alt.OverlayMarkDef(size=60, filled=True))
+            .encode(
+                x=alt.X("top_k:Q", title="Top K by model rank"),
+                y=alt.Y("value:Q", title="Value", axis=alt.Axis(format="%")),
+                color=alt.Color(
+                    "metric:N",
+                    title="",
+                    scale=alt.Scale(
+                        domain=[
+                            "Top-K average return",
+                            "Top-K hit rate (share > 0)",
+                        ],
+                        range=["#1abc9c", "#9b59b6"],
+                    ),
+                ),
+                tooltip=[
+                    alt.Tooltip("metric:N", title="Metric"),
+                    alt.Tooltip("top_k:Q", title="Top K"),
+                    alt.Tooltip("value:Q", title="Value", format=".2%"),
+                ],
+            )
+        )
+        st.altair_chart(cumulative_chart.interactive(), use_container_width=True)
+    else:
+        st.info("Performance lines populate once realized returns are available.")
+
     if price_mode == "live":
         table_phrase = "returns from open → latest"
     elif price_mode in {"historical_api", "upload"}:
         table_phrase = "returns from open → close"
     else:
         table_phrase = "returns (pending data)"
-    st.subheader(f"Top predictions ({table_phrase})")
+    st.subheader(f"Rank vs realized returns ({table_phrase})")
     if not chart_data.empty:
         scatter = (
             alt.Chart(chart_data)
@@ -1141,29 +1254,33 @@ with left:
         st.altair_chart((scatter + rolling).interactive(), use_container_width=True)
     else:
         st.info("Waiting for realized returns to plot.")
+    st.subheader("Ranked predictions table")
     st.dataframe(show, use_container_width=True, height=650)
 
 with right:
     st.subheader("Summary")
     st.metric("Session date (ET)", str(session_date))
     st.metric("Symbols shown", f"{show.shape[0]:,}")
-    if df_view["return_open_to_now"].notna().any():
-        realized_scope = df_view[df_view["return_open_to_now"].notna()]
-        if not realized_scope.empty:
-            top_slice = realized_scope.head(min(int(summary_topk), len(realized_scope)))
-            bottom_slice = realized_scope.tail(min(int(summary_bottomk), len(realized_scope)))
-
-            top_mean = top_slice["return_open_to_now"].mean()
-            bottom_mean = bottom_slice["return_open_to_now"].mean()
-
-            st.metric(
-                f"Mean return of Top-{len(top_slice)}",
-                f"{top_mean * 100:.2f}%",
-            )
-            st.metric(
-                f"Mean return of Bottom-{len(bottom_slice)}",
-                f"{bottom_mean * 100:.2f}%",
-            )
+    st.metric("Symbols with realized returns", f"{len(returns_ready_sorted):,}")
+    if not returns_ready_sorted.empty:
+        st.metric("Average realized return", _fmt_pct_display(avg_return_all))
+        st.metric(
+            f"Top-{top_k_count or summary_topk} mean return",
+            _fmt_pct_display(top_mean),
+        )
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} mean return",
+            _fmt_pct_display(bottom_mean),
+        )
+        st.metric("Long–short spread", _fmt_pct_display(long_short_spread))
+        st.metric(
+            f"Top-{top_k_count or summary_topk} hit rate",
+            _fmt_pct_display(top_win_rate),
+        )
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} hit rate",
+            _fmt_pct_display(bottom_win_rate),
+        )
 
     if price_mode == "live":
         total = len(symbols_eod)

@@ -915,21 +915,21 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
         map_k = np.nan
 
     metrics_rows = [
-        ("All ranks", "Spearman ρ (ranks ↔ returns)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
-        ("All ranks", "Kendall τ-b (ranks ↔ returns)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
-        ("All ranks", f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—"),
-        ("All ranks", "Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—"),
-        ("All ranks", "≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—"),
-        ("Long bucket", f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—"),
-        ("Short bucket", f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—"),
-        ("Spread", f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
-        ("Long bucket", f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
-        ("Short bucket", f"Bottom-{k} win rate (<0%)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—"),
-        ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—"),
-        ("Top-K", f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—"),
-        ("Top-K", f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—"),
+        ("All ranks", "Spearman ρ (ranks ↔ returns)", f"{spearman:.3f}" if pd.notna(spearman) else "—", "↑ toward +1"),
+        ("All ranks", "Kendall τ-b (ranks ↔ returns)", f"{kendall:.3f}" if pd.notna(kendall) else "—", "↑ toward +1"),
+        ("All ranks", f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—", "↑ toward +1"),
+        ("All ranks", "Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—", "↑ more positive"),
+        ("All ranks", "≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—", "↑ more positive"),
+        ("Long bucket", f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—", "↑ more positive"),
+        ("Short bucket", f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—", "↓ more negative"),
+        ("Spread", f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—", "↑ wider"),
+        ("Long bucket", f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—", "↑ toward 100%"),
+        ("Short bucket", f"Bottom-{k} win rate (<0%)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—", "↑ toward 100%"),
+        ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—", "↑ toward 1"),
+        ("Top-K", f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—", "↑ toward 1"),
+        ("Top-K", f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—", "↑ toward 100%"),
     ]
-    metrics_tbl = pd.DataFrame(metrics_rows, columns=["Focus", "Metric", "Value"])
+    metrics_tbl = pd.DataFrame(metrics_rows, columns=["Focus", "Metric", "Value", "Better ↗︎"])
 
     # Deciles by rank: 1 (best) → D (worst)
     D = int(min(10, max(3, ready.shape[0] // 10)))
@@ -1190,8 +1190,37 @@ with met_left:
     metrics_scope = "today" if price_mode == "live" and is_today_session else str(session_date)
     st.subheader(f"🧪 Robust rank⇄return metrics ({metrics_scope})")
     if not metrics_tbl.empty:
-        st.caption("Focus column separates long, short, and aggregate stats for day-to-day tracking.")
-        st.dataframe(metrics_tbl, use_container_width=True, height=330)
+        st.caption(
+            "Focus splits long/short/aggregate views; **Better ↗︎** is a quick tooltip on which way you want each metric to move."
+        )
+        st.dataframe(
+            metrics_tbl,
+            use_container_width=True,
+            height=330,
+            column_config={
+                "Better ↗︎": st.column_config.TextColumn(
+                    "Better ↗︎",
+                    help="Directionally helpful move for that metric (e.g., higher, more negative).",
+                    disabled=True,
+                )
+            },
+        )
+        with st.expander("How to read these numbers", expanded=False):
+            st.markdown(
+                """
+                **Correlations (Spearman/Kendall/Pearson)** — +1 is perfect rank↔return alignment, 0 is random, −1 is inverted.
+                Daily open→now data is noisy, so sustained readings above ~0.20 usually indicate meaningful skill.
+
+                **Slope & bps/10 ranks** — positive values mean returns improve as rank gets better. Values near zero imply
+                little payoff for reordering; +10 bps per 10 ranks means a 10-place improvement is worth ~0.10%.
+
+                **Bucket medians & win rates** — long medians/win rates should trend positive and short medians should be
+                negative. A long–short spread above 0 and win rates above 55–60% are typical of a healthy day.
+
+                **Ranking scores (NDCG/MAP/Precision)** — all live in [0, 1]. Higher means more positive-return ideas surfaced
+                near the top. 0.5 is “coin flip” behaviour; >0.7 usually reflects strong signal for the current session.
+                """
+            )
     else:
         st.info("Metrics unavailable (no non-NA returns yet).")
 

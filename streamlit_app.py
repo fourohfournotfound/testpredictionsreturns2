@@ -126,6 +126,30 @@ with st.sidebar:
     today_ny = datetime.now(tz=NY).date()
     session_date = st.date_input("Target trading session (ET)", value=today_ny)
 
+    # Price sourcing
+    st.write("**Price data source**")
+    price_source = st.selectbox(
+        "Where should OHLC prices come from?",
+        (
+            "Auto (live today, historical API otherwise)",
+            "Force live (today only)",
+            "Historical via EODHD API",
+            "Upload daily OHLCV",
+        ),
+        help=(
+            "Auto = live quotes when the session matches today, otherwise daily bars via the EODHD EOD API. "
+            "Upload lets you provide your own daily OHLCV file (MultiIndex CSV supported)."
+        ),
+    )
+
+    uploaded_ohlcv_file = None
+    if price_source == "Upload daily OHLCV":
+        uploaded_ohlcv_file = st.file_uploader(
+            "Upload daily OHLCV (CSV)",
+            type=["csv"],
+            help="Expect columns like ticker/date/open/close. MultiIndex CSVs are also supported.",
+        )
+
     # Symbol format
     st.write("**Symbol format**")
     exchange_suffix = st.text_input(
@@ -228,6 +252,45 @@ def _load_predictions_from_path(path: str) -> pd.DataFrame:
 def _load_predictions_from_upload(upload: io.BytesIO) -> pd.DataFrame:
     return _normalize_predictions(pd.read_csv(upload))
 
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OHLCV daily bars (ticker/date/open/close at minimum)."""
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
+
+    cols = {c.lower().strip(): c for c in df.columns}
+    ticker_col = next((cols[k] for k in cols if k in ["ticker", "symbol"]), None)
+    date_col = next((cols[k] for k in cols if k in ["date", "session_date", "day"]), None)
+    open_col = next((cols[k] for k in cols if k in ["open", "open_price", "o"]), None)
+    close_col = next((cols[k] for k in cols if k in ["close", "close_price", "c", "last"]), None)
+
+    missing = []
+    if ticker_col is None: missing.append("ticker")
+    if date_col is None:   missing.append("date")
+    if open_col is None:   missing.append("open")
+    if close_col is None:  missing.append("close")
+    if missing:
+        st.error("OHLCV file missing required column(s): " + ", ".join(missing))
+        st.stop()
+
+    out = df.rename(columns={
+        ticker_col: "ticker",
+        date_col: "date",
+        open_col: "open",
+        close_col: "close",
+    })
+
+    out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
+    out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.date
+    numeric_cols = [c for c in ["open", "close", "adj_close"] if c in out.columns]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    keep_cols = [c for c in ["ticker", "date", "open", "close", "adj_close", "high", "low", "volume"] if c in out.columns]
+    return out[keep_cols]
+
+def _load_ohlcv_from_upload(upload: io.BytesIO) -> pd.DataFrame:
+    return _normalize_ohlcv(pd.read_csv(upload))
+
 def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFrame:
     out = df.copy()
     if "date" in out.columns:
@@ -273,6 +336,37 @@ def _strip_suffix(symbol: str) -> str:
 def _chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _historical_daily_bars(symbols_eod: Tuple[str, ...], session: date) -> pd.DataFrame:
+    """Fetch historical daily bars (open/close) for a single session via EODHD EOD API."""
+    if not symbols_eod:
+        return pd.DataFrame(columns=["symbol", "open", "close"]).set_index("symbol")
+
+    iso = session.strftime("%Y-%m-%d")
+    frames = []
+    for sym in symbols_eod:
+        url = f"{BASE_HOST}/api/eod/{sym}?from={iso}&to={iso}&api_token={API_TOKEN}&fmt=json"
+        try:
+            r = _http.get(url, timeout=10)
+            if not r.ok:
+                continue
+            payload = r.json()
+            if isinstance(payload, list) and payload:
+                bar = payload[0]
+                frames.append({
+                    "symbol": sym,
+                    "open": bar.get("open", np.nan),
+                    "close": bar.get("close", np.nan),
+                })
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "open", "close"]).set_index("symbol")
+
+    out = pd.DataFrame(frames).drop_duplicates(subset=["symbol"]).set_index("symbol")
+    return out
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_LIVEV2)
 def _livev2_quotes_once(symbols_eod: Tuple[str, ...]) -> pd.DataFrame:
@@ -404,6 +498,7 @@ preds = _align_and_filter_for_session(preds, session_date)
 preds_ranked = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
 preds_ranked["rank"] = np.arange(1, len(preds_ranked) + 1)
 preds_ranked = preds_ranked.head(int(top_n))
+preds_ranked["ticker"] = preds_ranked["ticker"].astype(str).str.upper().str.strip()
 st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 
 # Session guard
@@ -417,57 +512,109 @@ symbols_in = preds_ranked["ticker"].dropna().astype(str).str.upper().tolist()
 symbols_eod = [_to_eod_symbol(t, exchange_suffix) for t in symbols_in]
 symbols_eod_tuple = tuple(symbols_eod)  # for cache key stability
 
-# -----------------------
-# HTTP snapshot (opens + initial last)
-# -----------------------
-# One-time (cached) snapshot
-quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)  # index: EOD symbol
-# Optional periodic refresh to gently correct drift if desired
-if _should_http_refresh():
-    quotes_snapshot = _livev2_quotes_once.clear() and _livev2_quotes_once(symbols_eod_tuple)  # invalidate + refetch
-    _mark_http_refreshed()
+is_today_session = session_date == today_ny
+is_past_session = session_date < today_ny
+
+if price_source == "Force live (today only)":
+    price_mode = "live"
+elif price_source == "Historical via EODHD API":
+    price_mode = "historical_api"
+elif price_source == "Upload daily OHLCV":
+    price_mode = "upload"
+else:
+    price_mode = "live" if is_today_session else ("historical_api" if is_past_session else "future")
+
+if price_mode == "live" and not is_today_session:
+    st.warning("Live mode only supports today's session — falling back to historical daily bars.")
+    price_mode = "historical_api"
+
+ohlcv_upload_df = None
+if price_mode == "upload":
+    if uploaded_ohlcv_file is None:
+        st.info("Upload a daily OHLCV CSV to evaluate past sessions without API calls.")
+        st.stop()
+    ohlcv_upload_df = _load_ohlcv_from_upload(uploaded_ohlcv_file)
+    st.caption(f"📐 Uploaded OHLCV shape after normalization: {ohlcv_upload_df.shape}")
 
 # -----------------------
-# Last-price cache persisted across refreshes
+# Price data assembly (live vs historical vs upload)
 # -----------------------
-if "last_price_cache" not in st.session_state:
-    st.session_state["last_price_cache"] = {}
-
-# Seed cache from snapshot for any missing symbols
-for sym in symbols_eod:
-    if sym not in st.session_state["last_price_cache"]:
-        try:
-            st.session_state["last_price_cache"][sym] = float(quotes_snapshot.at[sym, "lastTradePrice"])
-        except Exception:
-            pass
-
-# -----------------------
-# Rotating WS update (optional)
-# -----------------------
-if ws_enabled:
-    if not _HAS_WS:
-        st.info("websocket-client not installed; staying on delayed HTTP only.")
-    else:
-        rot = st.session_state.get("ws_rot_idx", 0)
-        ws_prices = _ws_update_prices_rotating(ws_url, symbols_eod, min(ws_window, DEFAULT_WS_WINDOW), ws_dwell, rot)
-        # Update cache with any fresh prints from this slice
-        for sym, px in ws_prices.items():
-            st.session_state["last_price_cache"][sym] = px
-        st.session_state["ws_rot_idx"] = rot + 1
-
-# -----------------------
-# Build view: open from HTTP snapshot; last price from cache (or snapshot fallback)
-# -----------------------
-open_series = quotes_snapshot["open"] if "open" in quotes_snapshot.columns else pd.Series(dtype=float)
-last_series = pd.Series({s: st.session_state["last_price_cache"].get(s, np.nan) for s in symbols_eod}, dtype=float)
-
 map_df = pd.DataFrame({"ticker": symbols_in, "eod_symbol": symbols_eod}).drop_duplicates()
+map_df["base_ticker"] = map_df["ticker"].str.upper().str.strip()
 df_view = preds_ranked.merge(map_df, on="ticker", how="left")
-df_view = df_view.merge(open_series.rename("open_today"), left_on="eod_symbol", right_index=True, how="left")
-df_view = df_view.merge(last_series.rename("last_price"), left_on="eod_symbol", right_index=True, how="left")
+if "base_ticker" in df_view.columns:
+    df_view["base_ticker"] = df_view["base_ticker"].fillna(df_view["ticker"].astype(str).str.upper().str.strip())
+else:
+    df_view["base_ticker"] = df_view["ticker"].astype(str).str.upper().str.strip()
+
+df_view["open_today"] = np.nan
+df_view["last_price"] = np.nan
+
+quotes_snapshot = None
+hist = None
+session_rows_all = None
+session_rows = None
+
+if price_mode == "live":
+    quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)  # index: EOD symbol
+    if _should_http_refresh():
+        _livev2_quotes_once.clear()
+        quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)
+        _mark_http_refreshed()
+
+    if "last_price_cache" not in st.session_state:
+        st.session_state["last_price_cache"] = {}
+
+    for sym in symbols_eod:
+        if sym not in st.session_state["last_price_cache"]:
+            try:
+                st.session_state["last_price_cache"][sym] = float(quotes_snapshot.at[sym, "lastTradePrice"])
+            except Exception:
+                pass
+
+    if ws_enabled:
+        if not _HAS_WS:
+            st.info("websocket-client not installed; staying on delayed HTTP only.")
+        else:
+            rot = st.session_state.get("ws_rot_idx", 0)
+            ws_prices = _ws_update_prices_rotating(ws_url, symbols_eod, min(ws_window, DEFAULT_WS_WINDOW), ws_dwell, rot)
+            for sym, px in ws_prices.items():
+                st.session_state["last_price_cache"][sym] = px
+            st.session_state["ws_rot_idx"] = rot + 1
+
+    open_series = quotes_snapshot["open"] if "open" in quotes_snapshot.columns else pd.Series(dtype=float)
+    last_series = pd.Series({s: st.session_state["last_price_cache"].get(s, np.nan) for s in symbols_eod}, dtype=float)
+    df_view["open_today"] = df_view["eod_symbol"].map(open_series)
+    df_view["last_price"] = df_view["eod_symbol"].map(last_series)
+
+elif price_mode == "historical_api":
+    hist = _historical_daily_bars(symbols_eod_tuple, session_date)
+    st.caption(f"📐 Historical EOD bars fetched: {hist.shape}")
+    if hist.empty:
+        st.warning("No historical bars returned for this session from EODHD.")
+    df_view["open_today"] = df_view["eod_symbol"].map(hist["open"] if "open" in hist.columns else pd.Series(dtype=float))
+    df_view["last_price"] = df_view["eod_symbol"].map(hist["close"] if "close" in hist.columns else pd.Series(dtype=float))
+
+elif price_mode == "upload":
+    session_rows_all = ohlcv_upload_df[ohlcv_upload_df["date"] == session_date]
+    st.caption(f"📐 Uploaded OHLCV rows for {session_date}: {session_rows_all.shape}")
+    if session_rows_all.empty:
+        st.warning("Uploaded OHLCV file has no rows for this session date.")
+    session_rows = session_rows_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
+    df_view["open_today"] = df_view["base_ticker"].map(session_rows["open"] if "open" in session_rows.columns else pd.Series(dtype=float))
+    close_col = "close" if "close" in session_rows.columns else None
+    if close_col is None and "adj_close" in session_rows.columns:
+        close_col = "adj_close"
+    if close_col is None:
+        st.error("Uploaded OHLCV file needs a 'close' or 'adj_close' column for returns.")
+        st.stop()
+    df_view["last_price"] = df_view["base_ticker"].map(session_rows[close_col])
+
+else:  # future session
+    st.info("Selected session is in the future. Returns will populate once data is available.")
 
 # Compute open→now return (suppress before regular open)
-if now_et < session_open:
+if price_mode == "live" and now_et < session_open:
     df_view["return_open_to_now"] = np.nan
 else:
     df_view["return_open_to_now"] = (df_view["last_price"] / df_view["open_today"] - 1.0).replace([np.inf, -np.inf], np.nan)
@@ -490,6 +637,25 @@ show = df_view[display_cols].copy()
 show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
+
+if price_mode == "live":
+    open_label = "Open (today)"
+    last_label = "Last price"
+    return_label = "Return (open→now)"
+elif price_mode in {"historical_api", "upload"}:
+    open_label = "Open"
+    last_label = "Close"
+    return_label = "Return (open→close)"
+else:
+    open_label = "Open"
+    last_label = "Last price"
+    return_label = "Return"
+
+show = show.rename(columns={
+    "open_today": open_label,
+    "last_price": last_label,
+    "return_open_to_now": return_label,
+})
 
 # -----------------------
 # NEW: Robust rank⇄return metrics (no API calls; in-memory)
@@ -641,15 +807,56 @@ metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_t
 # -----------------------
 # UI
 # -----------------------
+
+price_mode_label_map = {
+    "live": "HTTP + rotating WS" if ws_enabled else "HTTP (delayed only)",
+    "historical_api": "Historical daily bars (EODHD API)",
+    "upload": "Uploaded OHLCV file",
+    "future": "Future session (awaiting data)",
+}
+price_mode_label = price_mode_label_map.get(price_mode, str(price_mode))
+
+price_dim_lines = [
+    f"predictions_raw: {preds.shape}",
+    f"ranked_topN:     {preds_ranked.shape}",
+]
+
+if price_mode == "live":
+    snap_shape = quotes_snapshot.shape if isinstance(quotes_snapshot, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"quotes_snapshot: {snap_shape}")
+elif price_mode == "historical_api":
+    hist_shape = hist.shape if isinstance(hist, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"historical_bars: {hist_shape}")
+elif price_mode == "upload":
+    upload_shape = session_rows_all.shape if isinstance(session_rows_all, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"uploaded_rows: {upload_shape}")
+else:
+    price_dim_lines.append("price_data: future (n/a)")
+
+price_dim_lines.extend([
+    f"joined_view:     {df_view.shape}",
+    f"mode:            {price_mode_label}",
+])
 st.title("📈 Live LTR Monitor — Predictions vs Open→Now Returns (EODHD, rotating WS)")
 st.caption(
     "Opens fetched once via **Live v2 (delayed)**; last prices updated by **rotating WebSocket slices** "
     f"(chunk ≤{DEFAULT_WS_WINDOW}). This keeps HTTP API calls low while still refreshing a large watchlist."
 )
 
+if price_mode in {"historical_api", "upload"}:
+    st.caption("Historical mode: returns use session open → close (no WebSocket refresh required).")
+elif price_mode == "future":
+    st.caption("Future session selected — waiting for market data to arrive.")
+
 left, right = st.columns([3, 2], gap="large")
 with left:
-    st.subheader("Top predictions (returns from open → latest)")
+    if price_mode == "live":
+        table_phrase = "returns from open → latest"
+    elif price_mode in {"historical_api", "upload"}:
+        table_phrase = "returns from open → close"
+    else:
+        table_phrase = "returns (pending data)"
+    st.subheader(f"Top predictions ({table_phrase})")
     st.dataframe(show, use_container_width=True, height=650)
 
 with right:
@@ -660,36 +867,30 @@ with right:
         realized_top_mean = df_view["return_open_to_now"].head(min(20, len(df_view))).mean()
         st.metric("Mean return of Top-20", f"{realized_top_mean*100:.2f}%")
 
-    # Rotation diagnostics
-    total = len(symbols_eod)
-    rot = st.session_state.get("ws_rot_idx", 0)
-    current_slice_start = (rot * min(ws_window, DEFAULT_WS_WINDOW)) % max(total, 1) if total else 0
-    st.write(" ")
-    st.write("**Rotation status**")
-    st.code(
-        f"total_symbols:    {total}\n"
-        f"ws_chunk_size:    {min(ws_window, DEFAULT_WS_WINDOW)}\n"
-        f"ws_dwell_seconds: {ws_dwell}\n"
-        f"rotation_index:   {rot}\n"
-        f"slice_start_idx:  {current_slice_start}",
-        language="text",
-    )
+    if price_mode == "live":
+        total = len(symbols_eod)
+        rot = st.session_state.get("ws_rot_idx", 0)
+        current_slice_start = (rot * min(ws_window, DEFAULT_WS_WINDOW)) % max(total, 1) if total else 0
+        st.write(" ")
+        st.write("**Rotation status**")
+        st.code(
+            f"total_symbols:    {total}\n"
+            f"ws_chunk_size:    {min(ws_window, DEFAULT_WS_WINDOW)}\n"
+            f"ws_dwell_seconds: {ws_dwell}\n"
+            f"rotation_index:   {rot}\n"
+            f"slice_start_idx:  {current_slice_start}",
+            language="text",
+        )
 
     st.write(" ")
     st.write("**Dimensions audit**")
-    st.code(
-        f"predictions_raw: {preds.shape}\n"
-        f"ranked_topN:     {preds_ranked.shape}\n"
-        f"quotes_snapshot: {quotes_snapshot.shape}\n"
-        f"joined_view:     {df_view.shape}\n"
-        f"mode:            {'HTTP + rotating WS' if ws_enabled else 'HTTP (delayed only)'}",
-        language="text",
-    )
+    st.code("\n".join(price_dim_lines), language="text")
 
 st.write("---")
 met_left, met_right = st.columns([2, 3], gap="large")
 with met_left:
-    st.subheader("🧪 Robust rank⇄return metrics (today)")
+    metrics_scope = "today" if price_mode == "live" and is_today_session else str(session_date)
+    st.subheader(f"🧪 Robust rank⇄return metrics ({metrics_scope})")
     if not metrics_tbl.empty:
         st.dataframe(metrics_tbl, use_container_width=True, height=330)
     else:
@@ -715,7 +916,8 @@ st.download_button(
     mime="text/csv",
 )
 
-st.caption(
-    "Tip: Keep HTTP refresh at **0 minutes** when monitoring large lists to avoid burning daily API calls. "
-    "WebSockets don’t consume API calls; default WS limit is ~50 symbols per connection (upgradeable)."
-)
+if price_mode == "live":
+    st.caption(
+        "Tip: Keep HTTP refresh at **0 minutes** when monitoring large lists to avoid burning daily API calls. "
+        "WebSockets don’t consume API calls; default WS limit is ~50 symbols per connection (upgradeable)."
+    )

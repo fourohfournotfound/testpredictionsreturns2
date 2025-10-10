@@ -74,6 +74,12 @@ DEFAULT_PREDICTIONS_PATHS = [
     "/mnt/data/live_predictions.csv",
 ]
 
+DEFAULT_BASELINE_PATHS = [
+    os.environ.get("BASELINE_PREDICTIONS_CSV", "").strip() or "",
+    "baseline_predictions.csv",
+    "/mnt/data/baseline_predictions.csv",
+]
+
 # -----------------------
 # Secrets / env
 # -----------------------
@@ -121,6 +127,21 @@ with st.sidebar:
     else:
         upload_file = st.file_uploader("Upload CSV", type=["csv"])
         preds_path = None
+
+    st.write("**Baseline predictions (optional)**")
+    baseline_src = st.radio("Baseline source", ["None", "Local path", "Upload"], index=0)
+    baseline_upload = None
+    baseline_path = None
+    if baseline_src == "Local path":
+        baseline_default = next((p for p in DEFAULT_BASELINE_PATHS if p and os.path.exists(p)), DEFAULT_BASELINE_PATHS[0] or "baseline_predictions.csv")
+        baseline_path = st.text_input(
+            "Baseline CSV path",
+            value=baseline_default,
+            help="Optional reference model to compare rank shifts.",
+            key="baseline_path",
+        )
+    elif baseline_src == "Upload":
+        baseline_upload = st.file_uploader("Upload baseline CSV", type=["csv"], key="baseline_upload")
 
     # Session date
     st.write("**Session date**")
@@ -513,11 +534,37 @@ if preds.empty:
     st.info("Upload or point to your predictions CSV to get started. Expect columns like: `ticker`, `prediction`, optional `date`, optional `as_of`.")
     st.stop()
 
+# Optional baseline predictions
+baseline = pd.DataFrame(columns=["ticker", "prediction"])
+baseline_ranked = pd.DataFrame()
+if baseline_src != "None":
+    try:
+        if baseline_src == "Local path" and baseline_path:
+            if os.path.exists(baseline_path):
+                baseline = _load_predictions_from_path(baseline_path)
+            else:
+                st.warning(f"Baseline path not found: {baseline_path}")
+        elif baseline_src == "Upload" and baseline_upload is not None:
+            baseline = _load_predictions_from_upload(baseline_upload)
+    except Exception as e:
+        st.warning(f"Failed to load baseline predictions: {e}")
+
+if not baseline.empty:
+    baseline = _align_and_filter_for_session(baseline, session_date)
+    baseline = _post_asof_guard(baseline, session_open, require_asof_guard=require_asof_guard)
+    baseline_ranked = baseline.sort_values("prediction", ascending=False).reset_index(drop=True)
+    baseline_ranked["baseline_rank"] = np.arange(1, len(baseline_ranked) + 1)
+    baseline_ranked["ticker"] = baseline_ranked["ticker"].astype(str).str.upper().str.strip()
+    baseline_ranked = baseline_ranked.rename(columns={"prediction": "baseline_prediction"})
+    st.caption(f"📐 Baseline predictions shape (after normalization): {baseline_ranked.shape}")
+
 # Filter to session & rank
 preds = _align_and_filter_for_session(preds, session_date)
-preds_ranked = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
+preds_ranked_full = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
+preds_ranked_full["full_rank"] = np.arange(1, len(preds_ranked_full) + 1)
+preds_ranked_full["ticker"] = preds_ranked_full["ticker"].astype(str).str.upper().str.strip()
+preds_ranked = preds_ranked_full.head(int(top_n)).copy()
 preds_ranked["rank"] = np.arange(1, len(preds_ranked) + 1)
-preds_ranked = preds_ranked.head(int(top_n))
 preds_ranked["ticker"] = preds_ranked["ticker"].astype(str).str.upper().str.strip()
 st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 
@@ -566,6 +613,15 @@ if "base_ticker" in df_view.columns:
     df_view["base_ticker"] = df_view["base_ticker"].fillna(df_view["ticker"].astype(str).str.upper().str.strip())
 else:
     df_view["base_ticker"] = df_view["ticker"].astype(str).str.upper().str.strip()
+
+if not baseline_ranked.empty:
+    baseline_cols = baseline_ranked[["ticker", "baseline_prediction", "baseline_rank"]]
+    df_view = df_view.merge(baseline_cols, on="ticker", how="left")
+else:
+    df_view["baseline_prediction"] = np.nan
+    df_view["baseline_rank"] = np.nan
+
+df_view["rank_delta_vs_baseline"] = df_view["baseline_rank"] - df_view["rank"]
 
 df_view["open_today"] = np.nan
 df_view["last_price"] = np.nan
@@ -651,12 +707,31 @@ df_view = df_view.sort_values("prediction", ascending=False).reset_index(drop=Tr
 # Pretty formatting
 def _fmt_pct(x):   return "" if pd.isna(x) else f"{x*100:.2f}%"
 def _fmt_price(x): return "" if pd.isna(x) else f"{x:.2f}"
+def _fmt_rank(x):  return "" if pd.isna(x) else f"{int(x)}"
+def _fmt_delta(x):
+    if pd.isna(x):
+        return ""
+    return f"{int(x):+d}"
 
-display_cols = ["rank", "ticker", "prediction", "open_today", "last_price", "return_open_to_now"]
+display_cols = [
+    "rank",
+    "baseline_rank",
+    "rank_delta_vs_baseline",
+    "ticker",
+    "prediction",
+    "baseline_prediction",
+    "open_today",
+    "last_price",
+    "return_open_to_now",
+]
 show = df_view[display_cols].copy()
+show["rank"] = show["rank"].apply(_fmt_rank)
+show["baseline_rank"] = show["baseline_rank"].apply(_fmt_rank)
+show["rank_delta_vs_baseline"] = show["rank_delta_vs_baseline"].apply(_fmt_delta)
 show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
+show["baseline_prediction"] = show["baseline_prediction"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.6f}")
 
 chart_data = (
     df_view[["rank", "ticker", "prediction", "return_open_to_now"]]
@@ -686,9 +761,13 @@ else:
     return_label = "Return"
 
 show = show.rename(columns={
+    "rank": "Rank",
     "open_today": open_label,
     "last_price": last_label,
     "return_open_to_now": return_label,
+    "baseline_rank": "Baseline rank",
+    "rank_delta_vs_baseline": "Δ rank (baseline→now)",
+    "baseline_prediction": "Baseline prediction",
 })
 
 # -----------------------
@@ -782,7 +861,7 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     st.caption(f"📐 Metrics-ready rows (after NA drop): {ready.shape}")
 
     if ready.empty:
-        return pd.DataFrame(columns=["metric", "value"]), pd.DataFrame(columns=["decile", "median_return"])
+        return pd.DataFrame(columns=["Focus", "Metric", "Value"]), pd.DataFrame(columns=["decile", "median_return"])
 
     # Use negative rank so "higher is better" for correlation orientation
     ready["neg_rank"] = -ready["rank"].astype(float)
@@ -809,6 +888,7 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     bot_med = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
     l_s_med = top_med - bot_med if pd.notna(top_med) and pd.notna(bot_med) else np.nan
     top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
+    bot_win = float((bot["return_open_to_now"] < 0).mean()) if not bot.empty else np.nan
 
     # Ranking metrics @K (Top-K by predicted rank)
     ready_sorted = ready.sort_values("rank")
@@ -835,22 +915,21 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
         map_k = np.nan
 
     metrics_rows = [
-        ("Spearman ρ (−rank vs return)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
-        ("Kendall τ-b (−rank vs return)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
-        (f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—"),
-        ("Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—"),
-        ("≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—"),
-        (f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—"),
-        (f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—"),
-        (f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
-        (f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
+        ("All ranks", "Spearman ρ (ranks ↔ returns)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
+        ("All ranks", "Kendall τ-b (ranks ↔ returns)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
+        ("All ranks", f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—"),
+        ("All ranks", "Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—"),
+        ("All ranks", "≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—"),
+        ("Long bucket", f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—"),
+        ("Short bucket", f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—"),
+        ("Spread", f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
+        ("Long bucket", f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
+        ("Short bucket", f"Bottom-{k} win rate (<0%)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—"),
+        ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—"),
+        ("Top-K", f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—"),
+        ("Top-K", f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—"),
     ]
-    metrics_rows.extend([
-        (f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—"),
-        (f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—"),
-        (f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—"),
-    ])
-    metrics_tbl = pd.DataFrame(metrics_rows, columns=["metric", "value"])
+    metrics_tbl = pd.DataFrame(metrics_rows, columns=["Focus", "Metric", "Value"])
 
     # Deciles by rank: 1 (best) → D (worst)
     D = int(min(10, max(3, ready.shape[0] // 10)))
@@ -874,6 +953,97 @@ if deciles_tbl is not None and not deciles_tbl.empty:
     decile_label = deciles_chart_data.columns[0]
     deciles_chart_data = deciles_chart_data.rename(columns={decile_label: "rank_decile"})
     deciles_chart_data["rank_decile"] = deciles_chart_data["rank_decile"].astype(str)
+
+baseline_overlap_tbl = pd.DataFrame()
+baseline_corr_tbl = pd.DataFrame()
+baseline_shift_up = pd.DataFrame()
+baseline_shift_down = pd.DataFrame()
+if not baseline_ranked.empty:
+    long_main = preds_ranked["ticker"].tolist()
+    long_baseline = baseline_ranked.head(int(top_n))["ticker"].tolist()
+    long_overlap = len(set(long_main) & set(long_baseline))
+    long_pct = long_overlap / max(1, len(long_main))
+
+    short_cut = int(min(int(top_n), len(preds))) if len(preds) else 0
+    short_baseline_cut = int(min(int(top_n), len(baseline_ranked))) if len(baseline_ranked) else 0
+    short_main_df = preds.sort_values("prediction", ascending=True).head(short_cut)
+    short_baseline_df = baseline_ranked.sort_values("baseline_prediction", ascending=True).head(short_baseline_cut)
+    short_main = short_main_df["ticker"].astype(str).str.upper().tolist()
+    short_baseline = short_baseline_df["ticker"].tolist()
+    short_overlap = len(set(short_main) & set(short_baseline))
+    short_pct = short_overlap / max(1, len(short_main))
+
+    baseline_overlap_rows = [
+        ("Long", "Main Top-N size", f"{len(long_main):,}"),
+        ("Long", "Baseline Top-N size", f"{len(long_baseline):,}"),
+        ("Long", "Overlap count", f"{long_overlap:,}"),
+        ("Long", "Overlap % of main", f"{long_pct*100:.1f}%"),
+        ("Short", "Main Bottom-N size", f"{len(short_main):,}"),
+        ("Short", "Baseline Bottom-N size", f"{len(short_baseline):,}"),
+        ("Short", "Overlap count", f"{short_overlap:,}"),
+        ("Short", "Overlap % of main", f"{short_pct*100:.1f}%"),
+    ]
+    baseline_overlap_tbl = pd.DataFrame(baseline_overlap_rows, columns=["Focus", "Metric", "Value"])
+
+    merged_full = preds_ranked_full.merge(
+        baseline_ranked[["ticker", "baseline_rank", "baseline_prediction"]],
+        on="ticker",
+        how="inner",
+    )
+    merged_full = merged_full.rename(columns={"full_rank": "rank"})
+    if merged_full.shape[0] >= 2:
+        rank_spearman = _spearman_corr(merged_full["rank"], merged_full["baseline_rank"])
+        rank_kendall = _kendall_tau_b(merged_full["rank"], merged_full["baseline_rank"])
+        pred_pearson = _pearson_corr(merged_full["prediction"], merged_full["baseline_prediction"])
+    else:
+        rank_spearman = np.nan
+        rank_kendall = np.nan
+        pred_pearson = np.nan
+
+    baseline_corr_rows = [
+        ("Ranks", "Spearman ρ", f"{rank_spearman:.3f}" if pd.notna(rank_spearman) else "—"),
+        ("Ranks", "Kendall τ-b", f"{rank_kendall:.3f}" if pd.notna(rank_kendall) else "—"),
+        ("Predictions", "Pearson r", f"{pred_pearson:.3f}" if pd.notna(pred_pearson) else "—"),
+    ]
+    baseline_corr_tbl = pd.DataFrame(baseline_corr_rows, columns=["Focus", "Metric", "Value"])
+
+    shift_scope = df_view[df_view["baseline_rank"].notna()].copy()
+    if not shift_scope.empty:
+        shift_scope["rank_delta_vs_baseline"] = shift_scope["rank_delta_vs_baseline"].astype(float)
+        baseline_shift_up = (
+            shift_scope.sort_values("rank_delta_vs_baseline", ascending=False)
+            .head(5)
+            [["ticker", "rank", "baseline_rank", "rank_delta_vs_baseline", "prediction", "baseline_prediction"]]
+        )
+        baseline_shift_up = baseline_shift_up[baseline_shift_up["rank_delta_vs_baseline"] > 0]
+        baseline_shift_down = (
+            shift_scope.sort_values("rank_delta_vs_baseline", ascending=True)
+            .head(5)
+            [["ticker", "rank", "baseline_rank", "rank_delta_vs_baseline", "prediction", "baseline_prediction"]]
+        )
+        baseline_shift_down = baseline_shift_down[baseline_shift_down["rank_delta_vs_baseline"] < 0]
+
+    def _format_shift(tbl: pd.DataFrame) -> pd.DataFrame:
+        if tbl is None or tbl.empty:
+            return pd.DataFrame()
+        out = tbl.copy()
+        out["rank"] = out["rank"].astype(int)
+        out["baseline_rank"] = out["baseline_rank"].astype(int)
+        out["rank_delta_vs_baseline"] = out["rank_delta_vs_baseline"].astype(int)
+        out["prediction"] = out["prediction"].apply(lambda x: f"{float(x):.6f}")
+        out["baseline_prediction"] = out["baseline_prediction"].apply(lambda x: f"{float(x):.6f}")
+        return out.rename(
+            columns={
+                "rank": "Now rank",
+                "baseline_rank": "Baseline rank",
+                "rank_delta_vs_baseline": "Δ rank",
+                "prediction": "Now pred",
+                "baseline_prediction": "Baseline pred",
+            }
+        )
+
+    baseline_shift_up = _format_shift(baseline_shift_up)
+    baseline_shift_down = _format_shift(baseline_shift_down)
 
 
 # -----------------------
@@ -1020,6 +1190,7 @@ with met_left:
     metrics_scope = "today" if price_mode == "live" and is_today_session else str(session_date)
     st.subheader(f"🧪 Robust rank⇄return metrics ({metrics_scope})")
     if not metrics_tbl.empty:
+        st.caption("Focus column separates long, short, and aggregate stats for day-to-day tracking.")
         st.dataframe(metrics_tbl, use_container_width=True, height=330)
     else:
         st.info("Metrics unavailable (no non-NA returns yet).")
@@ -1056,6 +1227,34 @@ with met_right:
         st.dataframe(deciles_fmt, use_container_width=True, height=330)
     else:
         st.info("Decile table unavailable (insufficient rows).")
+
+if not baseline_ranked.empty:
+    st.write("---")
+    base_left, base_right = st.columns([2, 3], gap="large")
+    with base_left:
+        st.subheader("Baseline comparison")
+        st.caption("How the current ranking differs from the reference model.")
+        if not baseline_overlap_tbl.empty:
+            st.markdown("**Overlap & coverage**")
+            st.dataframe(baseline_overlap_tbl, use_container_width=True, height=240)
+        if not baseline_corr_tbl.empty:
+            st.markdown("**Rank / score correlations**")
+            st.dataframe(baseline_corr_tbl, use_container_width=True, height=150)
+    with base_right:
+        st.subheader("Largest rank moves vs baseline")
+        shifts_up_col, shifts_down_col = st.columns(2, gap="medium")
+        with shifts_up_col:
+            st.markdown("⬆️ Improved placement")
+            if not baseline_shift_up.empty:
+                st.dataframe(baseline_shift_up, use_container_width=True, height=230)
+            else:
+                st.info("No overlapping symbols yet.")
+        with shifts_down_col:
+            st.markdown("⬇️ Dropped placement")
+            if not baseline_shift_down.empty:
+                st.dataframe(baseline_shift_down, use_container_width=True, height=230)
+            else:
+                st.info("No overlapping symbols yet.")
 
 # Download
 csv_buf = io.StringIO()

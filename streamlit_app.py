@@ -45,6 +45,7 @@ np, pd = _safe_import_pd_np()
 import pytz
 from dateutil import parser as dateparser
 import requests
+import altair as alt
 
 try:
     import websocket  # websocket-client
@@ -71,6 +72,12 @@ DEFAULT_PREDICTIONS_PATHS = [
     os.environ.get("PREDICTIONS_CSV", "").strip() or "",
     "live_predictions.csv",
     "/mnt/data/live_predictions.csv",
+]
+
+DEFAULT_BASELINE_PATHS = [
+    os.environ.get("BASELINE_PREDICTIONS_CSV", "").strip() or "",
+    "baseline_predictions.csv",
+    "/mnt/data/baseline_predictions.csv",
 ]
 
 # -----------------------
@@ -120,6 +127,21 @@ with st.sidebar:
     else:
         upload_file = st.file_uploader("Upload CSV", type=["csv"])
         preds_path = None
+
+    st.write("**Baseline predictions (optional)**")
+    baseline_src = st.radio("Baseline source", ["None", "Local path", "Upload"], index=0)
+    baseline_upload = None
+    baseline_path = None
+    if baseline_src == "Local path":
+        baseline_default = next((p for p in DEFAULT_BASELINE_PATHS if p and os.path.exists(p)), DEFAULT_BASELINE_PATHS[0] or "baseline_predictions.csv")
+        baseline_path = st.text_input(
+            "Baseline CSV path",
+            value=baseline_default,
+            help="Optional reference model to compare rank shifts.",
+            key="baseline_path",
+        )
+    elif baseline_src == "Upload":
+        baseline_upload = st.file_uploader("Upload baseline CSV", type=["csv"], key="baseline_upload")
 
     # Session date
     st.write("**Session date**")
@@ -194,7 +216,7 @@ with st.sidebar:
         max_value=int(min(200, max(5, top_n))),
         value=int(min(20, top_n)),
         step=5,
-        help="Applies to Top/Bottom median returns and Top-K win rate."
+        help="Applies to Top/Bottom median returns, Top-K win rate, and ranking metrics (Precision@K / MAP@K / NDCG@K)."
     )
     winsor_tail_pct = st.slider(
         "Winsorize tails of 'return_open_to_now' (%) for metrics",
@@ -512,11 +534,37 @@ if preds.empty:
     st.info("Upload or point to your predictions CSV to get started. Expect columns like: `ticker`, `prediction`, optional `date`, optional `as_of`.")
     st.stop()
 
+# Optional baseline predictions
+baseline = pd.DataFrame(columns=["ticker", "prediction"])
+baseline_ranked = pd.DataFrame()
+if baseline_src != "None":
+    try:
+        if baseline_src == "Local path" and baseline_path:
+            if os.path.exists(baseline_path):
+                baseline = _load_predictions_from_path(baseline_path)
+            else:
+                st.warning(f"Baseline path not found: {baseline_path}")
+        elif baseline_src == "Upload" and baseline_upload is not None:
+            baseline = _load_predictions_from_upload(baseline_upload)
+    except Exception as e:
+        st.warning(f"Failed to load baseline predictions: {e}")
+
+if not baseline.empty:
+    baseline = _align_and_filter_for_session(baseline, session_date)
+    baseline = _post_asof_guard(baseline, session_open, require_asof_guard=require_asof_guard)
+    baseline_ranked = baseline.sort_values("prediction", ascending=False).reset_index(drop=True)
+    baseline_ranked["baseline_rank"] = np.arange(1, len(baseline_ranked) + 1)
+    baseline_ranked["ticker"] = baseline_ranked["ticker"].astype(str).str.upper().str.strip()
+    baseline_ranked = baseline_ranked.rename(columns={"prediction": "baseline_prediction"})
+    st.caption(f"📐 Baseline predictions shape (after normalization): {baseline_ranked.shape}")
+
 # Filter to session & rank
 preds = _align_and_filter_for_session(preds, session_date)
-preds_ranked = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
+preds_ranked_full = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
+preds_ranked_full["full_rank"] = np.arange(1, len(preds_ranked_full) + 1)
+preds_ranked_full["ticker"] = preds_ranked_full["ticker"].astype(str).str.upper().str.strip()
+preds_ranked = preds_ranked_full.head(int(top_n)).copy()
 preds_ranked["rank"] = np.arange(1, len(preds_ranked) + 1)
-preds_ranked = preds_ranked.head(int(top_n))
 preds_ranked["ticker"] = preds_ranked["ticker"].astype(str).str.upper().str.strip()
 st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
 
@@ -565,6 +613,15 @@ if "base_ticker" in df_view.columns:
     df_view["base_ticker"] = df_view["base_ticker"].fillna(df_view["ticker"].astype(str).str.upper().str.strip())
 else:
     df_view["base_ticker"] = df_view["ticker"].astype(str).str.upper().str.strip()
+
+if not baseline_ranked.empty:
+    baseline_cols = baseline_ranked[["ticker", "baseline_prediction", "baseline_rank"]]
+    df_view = df_view.merge(baseline_cols, on="ticker", how="left")
+else:
+    df_view["baseline_prediction"] = np.nan
+    df_view["baseline_rank"] = np.nan
+
+df_view["rank_delta_vs_baseline"] = df_view["baseline_rank"] - df_view["rank"]
 
 df_view["open_today"] = np.nan
 df_view["last_price"] = np.nan
@@ -650,12 +707,147 @@ df_view = df_view.sort_values("prediction", ascending=False).reset_index(drop=Tr
 # Pretty formatting
 def _fmt_pct(x):   return "" if pd.isna(x) else f"{x*100:.2f}%"
 def _fmt_price(x): return "" if pd.isna(x) else f"{x:.2f}"
+def _fmt_rank(x):  return "" if pd.isna(x) else f"{int(x)}"
+def _fmt_delta(x):
+    if pd.isna(x):
+        return ""
+    return f"{int(x):+d}"
 
-display_cols = ["rank", "ticker", "prediction", "open_today", "last_price", "return_open_to_now"]
+def _fmt_pct_display(x: float) -> str:
+    return "—" if pd.isna(x) else f"{x * 100:.2f}%"
+
+def _fmt_delta_points(x: float) -> str:
+    return "" if pd.isna(x) else f"{x * 100:.1f} pts"
+
+display_cols = [
+    "rank",
+    "baseline_rank",
+    "rank_delta_vs_baseline",
+    "ticker",
+    "prediction",
+    "baseline_prediction",
+    "open_today",
+    "last_price",
+    "return_open_to_now",
+]
 show = df_view[display_cols].copy()
+show["rank"] = show["rank"].apply(_fmt_rank)
+show["baseline_rank"] = show["baseline_rank"].apply(_fmt_rank)
+show["rank_delta_vs_baseline"] = show["rank_delta_vs_baseline"].apply(_fmt_delta)
 show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
+show["baseline_prediction"] = show["baseline_prediction"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.6f}")
+
+chart_data = (
+    df_view[["rank", "ticker", "prediction", "return_open_to_now"]]
+    .dropna(subset=["return_open_to_now"])
+    .copy()
+)
+if not chart_data.empty:
+    chart_data["return_direction"] = np.where(
+        chart_data["return_open_to_now"] >= 0,
+        "Positive",
+        "Negative",
+    )
+    chart_data.sort_values("rank", inplace=True)
+
+
+returns_ready = df_view[df_view["return_open_to_now"].notna()].copy()
+returns_ready_sorted = returns_ready.sort_values("rank") if not returns_ready.empty else returns_ready
+
+top_k_count = int(min(int(summary_topk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
+bottom_k_count = int(min(int(summary_bottomk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
+
+top_slice = returns_ready_sorted.head(top_k_count) if top_k_count else pd.DataFrame(columns=returns_ready.columns)
+bottom_slice = returns_ready_sorted.tail(bottom_k_count) if bottom_k_count else pd.DataFrame(columns=returns_ready.columns)
+
+top_mean = float(top_slice["return_open_to_now"].mean()) if not top_slice.empty else np.nan
+bottom_short_mean = (
+    float((-bottom_slice["return_open_to_now"]).mean()) if not bottom_slice.empty else np.nan
+)
+if not top_slice.empty and not bottom_slice.empty:
+    long_leg_sum = float(top_slice["return_open_to_now"].sum())
+    short_leg_sum = float((-bottom_slice["return_open_to_now"]).sum())
+    total_positions = top_slice.shape[0] + bottom_slice.shape[0]
+    long_short_spread = (long_leg_sum + short_leg_sum) / total_positions if total_positions else np.nan
+else:
+    long_short_spread = np.nan
+avg_return_all = float(returns_ready_sorted["return_open_to_now"].mean()) if not returns_ready_sorted.empty else np.nan
+
+top_win_rate = float((top_slice["return_open_to_now"] > 0).mean()) if not top_slice.empty else np.nan
+bottom_win_rate = float((bottom_slice["return_open_to_now"] < 0).mean()) if not bottom_slice.empty else np.nan
+
+topk_depth_returns = pd.DataFrame()
+topk_depth_hits = pd.DataFrame()
+if not returns_ready_sorted.empty:
+    long_curve = returns_ready_sorted[["return_open_to_now"]].reset_index(drop=True)
+    long_curve["top_k"] = np.arange(1, len(long_curve) + 1)
+    long_curve["mean_return"] = long_curve["return_open_to_now"].expanding().mean()
+    long_curve["hit_rate"] = (long_curve["return_open_to_now"] > 0).expanding().mean()
+
+    short_curve = (
+        returns_ready_sorted.sort_values("rank", ascending=False)[
+            ["return_open_to_now"]
+        ]
+        .reset_index(drop=True)
+    )
+    short_curve["top_k"] = np.arange(1, len(short_curve) + 1)
+    short_curve["mean_return"] = short_curve["return_open_to_now"].expanding().mean()
+    short_curve["hit_rate"] = (short_curve["return_open_to_now"] < 0).expanding().mean()
+
+    short_curve["short_mean_pnl"] = -short_curve["mean_return"]
+    long_short_spread_curve = 0.5 * (
+        long_curve["mean_return"].values + short_curve["short_mean_pnl"].values
+    )
+
+    topk_depth_returns = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "top_k": long_curve["top_k"],
+                    "series": "Long cumulative avg return",
+                    "value": long_curve["mean_return"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "top_k": short_curve["top_k"],
+                    "series": "Short cumulative avg return (short P&L)",
+                    "value": short_curve["short_mean_pnl"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "top_k": long_curve["top_k"],
+                    "series": "Equal-weight long–short spread (avg)",
+                    "value": long_short_spread_curve,
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    topk_depth_hits = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "top_k": long_curve["top_k"],
+                    "series": "Long hit rate (>0%)",
+                    "value": long_curve["hit_rate"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "top_k": short_curve["top_k"],
+                    "series": "Short hit rate (<0%)",
+                    "value": short_curve["hit_rate"],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+
 
 if price_mode == "live":
     open_label = "Open (today)"
@@ -671,9 +863,13 @@ else:
     return_label = "Return"
 
 show = show.rename(columns={
+    "rank": "Rank",
     "open_today": open_label,
     "last_price": last_label,
     "return_open_to_now": return_label,
+    "baseline_rank": "Baseline rank",
+    "rank_delta_vs_baseline": "Δ rank (baseline→now)",
+    "baseline_prediction": "Baseline prediction",
 })
 
 # -----------------------
@@ -767,10 +963,11 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     st.caption(f"📐 Metrics-ready rows (after NA drop): {ready.shape}")
 
     if ready.empty:
-        return pd.DataFrame(columns=["metric", "value"]), pd.DataFrame(columns=["decile", "median_return"])
+        return pd.DataFrame(columns=["Focus", "Metric", "Value"]), pd.DataFrame(columns=["decile", "median_return"])
 
     # Use negative rank so "higher is better" for correlation orientation
     ready["neg_rank"] = -ready["rank"].astype(float)
+    ready["relevance"] = pd.to_numeric(ready["return_open_to_now"], errors="coerce").clip(lower=0)
 
     # Winsorize returns for Pearson-style only (Spearman/Kendall are rank-based)
     p = max(0.0, min(0.5, float(winsor_pct) / 100.0))
@@ -790,22 +987,61 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     top = ready.nsmallest(k, "rank")  # rank 1..k
     bot = ready.nlargest(k, "rank")
     top_med = float(top["return_open_to_now"].median()) if not top.empty else np.nan
-    bot_med = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
-    l_s_med = top_med - bot_med if pd.notna(top_med) and pd.notna(bot_med) else np.nan
+    bot_med_raw = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
+    bot_med_short = -bot_med_raw if pd.notna(bot_med_raw) else np.nan
+    l_s_med = (
+        top_med + bot_med_short
+        if pd.notna(top_med) and pd.notna(bot_med_short)
+        else np.nan
+    )
     top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
+    bot_win = float((bot["return_open_to_now"] < 0).mean()) if not bot.empty else np.nan
+
+    # Ranking metrics @K (Top-K by predicted rank)
+    ready_sorted = ready.sort_values("rank")
+    k_rank = int(max(1, min(topk, ready_sorted.shape[0])))
+    rel = ready_sorted["relevance"].to_numpy()[:k_rank]
+    if k_rank > 0:
+        discounts = 1.0 / np.log2(np.arange(2, k_rank + 2))
+        gains = (np.power(2.0, rel) - 1.0) * discounts
+        dcg = float(np.sum(gains))
+        ideal_rel = np.sort(ready_sorted["relevance"].to_numpy())[::-1][:k_rank]
+        ideal_gains = (np.power(2.0, ideal_rel) - 1.0) * discounts
+        ideal_dcg = float(np.sum(ideal_gains))
+        ndcg_k = float(dcg / ideal_dcg) if ideal_dcg > 0 else np.nan
+
+        hits = (ready_sorted["return_open_to_now"].to_numpy()[:k_rank] > 0)
+        precision_k = float(hits.mean()) if k_rank > 0 else np.nan
+        cum_hits = np.cumsum(hits)
+        precisions = cum_hits / (np.arange(1, k_rank + 1))
+        relevant_total = int(hits.sum())
+        map_k = float(np.sum(precisions * hits) / relevant_total) if relevant_total > 0 else 0.0
+    else:
+        ndcg_k = np.nan
+        precision_k = np.nan
+        map_k = np.nan
 
     metrics_rows = [
-        ("Spearman ρ (−rank vs return)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
-        ("Kendall τ-b (−rank vs return)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
-        (f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—"),
-        ("Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—"),
-        ("≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—"),
-        (f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—"),
-        (f"Bottom-{k} median return", f"{bot_med*100:.2f}%" if pd.notna(bot_med) else "—"),
-        (f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
-        (f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
+        ("All ranks", "Spearman ρ (ranks ↔ returns)", f"{spearman:.3f}" if pd.notna(spearman) else "—", "↑ toward +1"),
+        ("All ranks", "Kendall τ-b (ranks ↔ returns)", f"{kendall:.3f}" if pd.notna(kendall) else "—", "↑ toward +1"),
+        ("All ranks", f"Winsorized Pearson r (tails={winsor_pct}%)", f"{pearson_w:.3f}" if pd.notna(pearson_w) else "—", "↑ toward +1"),
+        ("All ranks", "Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—", "↑ more positive"),
+        ("All ranks", "≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—", "↑ more positive"),
+        ("Long bucket", f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—", "↑ more positive"),
+        (
+            "Short bucket",
+            f"Bottom-{k} median short P&L",
+            f"{bot_med_short*100:.2f}%" if pd.notna(bot_med_short) else "—",
+            "↑ more positive",
+        ),
+        ("Spread", f"Median long–short (Top-{k} + Short-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—", "↑ wider"),
+        ("Long bucket", f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—", "↑ toward 100%"),
+        ("Short bucket", f"Bottom-{k} win rate (<0%)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—", "↑ toward 100%"),
+        ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—", "↑ toward 1"),
+        ("Top-K", f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—", "↑ toward 1"),
+        ("Top-K", f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—", "↑ toward 100%"),
     ]
-    metrics_tbl = pd.DataFrame(metrics_rows, columns=["metric", "value"])
+    metrics_tbl = pd.DataFrame(metrics_rows, columns=["Focus", "Metric", "Value", "Better ↗︎"])
 
     # Deciles by rank: 1 (best) → D (worst)
     D = int(min(10, max(3, ready.shape[0] // 10)))
@@ -822,6 +1058,105 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     return metrics_tbl, deciles
 
 metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_tail_pct)
+
+deciles_chart_data = pd.DataFrame()
+if deciles_tbl is not None and not deciles_tbl.empty:
+    deciles_chart_data = deciles_tbl.copy()
+    decile_label = deciles_chart_data.columns[0]
+    deciles_chart_data = deciles_chart_data.rename(columns={decile_label: "rank_decile"})
+    deciles_chart_data["rank_decile"] = deciles_chart_data["rank_decile"].astype(str)
+
+baseline_overlap_tbl = pd.DataFrame()
+baseline_corr_tbl = pd.DataFrame()
+baseline_shift_up = pd.DataFrame()
+baseline_shift_down = pd.DataFrame()
+if not baseline_ranked.empty:
+    long_main = preds_ranked["ticker"].tolist()
+    long_baseline = baseline_ranked.head(int(top_n))["ticker"].tolist()
+    long_overlap = len(set(long_main) & set(long_baseline))
+    long_pct = long_overlap / max(1, len(long_main))
+
+    short_cut = int(min(int(top_n), len(preds))) if len(preds) else 0
+    short_baseline_cut = int(min(int(top_n), len(baseline_ranked))) if len(baseline_ranked) else 0
+    short_main_df = preds.sort_values("prediction", ascending=True).head(short_cut)
+    short_baseline_df = baseline_ranked.sort_values("baseline_prediction", ascending=True).head(short_baseline_cut)
+    short_main = short_main_df["ticker"].astype(str).str.upper().tolist()
+    short_baseline = short_baseline_df["ticker"].tolist()
+    short_overlap = len(set(short_main) & set(short_baseline))
+    short_pct = short_overlap / max(1, len(short_main))
+
+    baseline_overlap_rows = [
+        ("Long", "Main Top-N size", f"{len(long_main):,}"),
+        ("Long", "Baseline Top-N size", f"{len(long_baseline):,}"),
+        ("Long", "Overlap count", f"{long_overlap:,}"),
+        ("Long", "Overlap % of main", f"{long_pct*100:.1f}%"),
+        ("Short", "Main Bottom-N size", f"{len(short_main):,}"),
+        ("Short", "Baseline Bottom-N size", f"{len(short_baseline):,}"),
+        ("Short", "Overlap count", f"{short_overlap:,}"),
+        ("Short", "Overlap % of main", f"{short_pct*100:.1f}%"),
+    ]
+    baseline_overlap_tbl = pd.DataFrame(baseline_overlap_rows, columns=["Focus", "Metric", "Value"])
+
+    merged_full = preds_ranked_full.merge(
+        baseline_ranked[["ticker", "baseline_rank", "baseline_prediction"]],
+        on="ticker",
+        how="inner",
+    )
+    merged_full = merged_full.rename(columns={"full_rank": "rank"})
+    if merged_full.shape[0] >= 2:
+        rank_spearman = _spearman_corr(merged_full["rank"], merged_full["baseline_rank"])
+        rank_kendall = _kendall_tau_b(merged_full["rank"], merged_full["baseline_rank"])
+        pred_pearson = _pearson_corr(merged_full["prediction"], merged_full["baseline_prediction"])
+    else:
+        rank_spearman = np.nan
+        rank_kendall = np.nan
+        pred_pearson = np.nan
+
+    baseline_corr_rows = [
+        ("Ranks", "Spearman ρ", f"{rank_spearman:.3f}" if pd.notna(rank_spearman) else "—"),
+        ("Ranks", "Kendall τ-b", f"{rank_kendall:.3f}" if pd.notna(rank_kendall) else "—"),
+        ("Predictions", "Pearson r", f"{pred_pearson:.3f}" if pd.notna(pred_pearson) else "—"),
+    ]
+    baseline_corr_tbl = pd.DataFrame(baseline_corr_rows, columns=["Focus", "Metric", "Value"])
+
+    shift_scope = df_view[df_view["baseline_rank"].notna()].copy()
+    if not shift_scope.empty:
+        shift_scope["rank_delta_vs_baseline"] = shift_scope["rank_delta_vs_baseline"].astype(float)
+        baseline_shift_up = (
+            shift_scope.sort_values("rank_delta_vs_baseline", ascending=False)
+            .head(5)
+            [["ticker", "rank", "baseline_rank", "rank_delta_vs_baseline", "prediction", "baseline_prediction"]]
+        )
+        baseline_shift_up = baseline_shift_up[baseline_shift_up["rank_delta_vs_baseline"] > 0]
+        baseline_shift_down = (
+            shift_scope.sort_values("rank_delta_vs_baseline", ascending=True)
+            .head(5)
+            [["ticker", "rank", "baseline_rank", "rank_delta_vs_baseline", "prediction", "baseline_prediction"]]
+        )
+        baseline_shift_down = baseline_shift_down[baseline_shift_down["rank_delta_vs_baseline"] < 0]
+
+    def _format_shift(tbl: pd.DataFrame) -> pd.DataFrame:
+        if tbl is None or tbl.empty:
+            return pd.DataFrame()
+        out = tbl.copy()
+        out["rank"] = out["rank"].astype(int)
+        out["baseline_rank"] = out["baseline_rank"].astype(int)
+        out["rank_delta_vs_baseline"] = out["rank_delta_vs_baseline"].astype(int)
+        out["prediction"] = out["prediction"].apply(lambda x: f"{float(x):.6f}")
+        out["baseline_prediction"] = out["baseline_prediction"].apply(lambda x: f"{float(x):.6f}")
+        return out.rename(
+            columns={
+                "rank": "Now rank",
+                "baseline_rank": "Baseline rank",
+                "rank_delta_vs_baseline": "Δ rank",
+                "prediction": "Now pred",
+                "baseline_prediction": "Baseline pred",
+            }
+        )
+
+    baseline_shift_up = _format_shift(baseline_shift_up)
+    baseline_shift_down = _format_shift(baseline_shift_down)
+
 
 # -----------------------
 # UI
@@ -867,38 +1202,185 @@ if price_mode in {"historical_api", "upload"}:
 elif price_mode == "future":
     st.caption("Future session selected — waiting for market data to arrive.")
 
+if not returns_ready_sorted.empty:
+    st.subheader("🚦 Performance snapshot")
+    summary_cols = st.columns(4, gap="large")
+    with summary_cols[0]:
+        st.metric("Avg return (all ranked)", _fmt_pct_display(avg_return_all))
+    with summary_cols[1]:
+        st.metric(
+            f"Top-{top_k_count or summary_topk} mean",
+            _fmt_pct_display(top_mean),
+        )
+    with summary_cols[2]:
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} mean short P&L",
+            _fmt_pct_display(bottom_short_mean),
+        )
+    with summary_cols[3]:
+        st.metric("Equal-weight long–short spread", _fmt_pct_display(long_short_spread))
+
+    rate_cols = st.columns(2, gap="large")
+    with rate_cols[0]:
+        st.metric(
+            f"Top-{top_k_count or summary_topk} hit rate",
+            _fmt_pct_display(top_win_rate),
+            delta=_fmt_delta_points(top_win_rate - 0.5) if pd.notna(top_win_rate) else None,
+        )
+    with rate_cols[1]:
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate (<0%)",
+            _fmt_pct_display(bottom_win_rate),
+            delta=_fmt_delta_points(bottom_win_rate - 0.5) if pd.notna(bottom_win_rate) else None,
+        )
+
 left, right = st.columns([3, 2], gap="large")
 with left:
+    st.subheader("Portfolio build-up by rank")
+    st.caption(
+        "Shows how cumulative average returns evolve as you add more names from the ranked list. "
+        "The short line converts negative returns into short-side P&L."
+    )
+    if not topk_depth_returns.empty:
+        returns_chart = (
+            alt.Chart(topk_depth_returns)
+            .mark_line(point=alt.OverlayMarkDef(size=60, filled=True))
+            .encode(
+                x=alt.X("top_k:Q", title="Portfolio size (K)"),
+                y=alt.Y(
+                    "value:Q",
+                    title="Cumulative avg return",
+                    axis=alt.Axis(format="%"),
+                ),
+                color=alt.Color(
+                    "series:N",
+                    title="",
+                    scale=alt.Scale(
+                        domain=[
+                            "Long cumulative avg return",
+                            "Short cumulative avg return (short P&L)",
+                            "Equal-weight long–short spread (avg)",
+                        ],
+                        range=["#1abc9c", "#e67e22", "#f1c40f"],
+                    ),
+                ),
+                tooltip=[
+                    alt.Tooltip("series:N", title="Metric"),
+                    alt.Tooltip("top_k:Q", title="K size"),
+                    alt.Tooltip("value:Q", title="Value", format=".2%"),
+                ],
+            )
+        )
+        st.altair_chart(returns_chart.interactive(), use_container_width=True)
+
+        hits_chart = (
+            alt.Chart(topk_depth_hits)
+            .mark_line(point=alt.OverlayMarkDef(size=50, filled=True), strokeDash=[4, 4])
+            .encode(
+                x=alt.X("top_k:Q", title="Portfolio size (K)"),
+                y=alt.Y(
+                    "value:Q",
+                    title="Cumulative hit rate",
+                    axis=alt.Axis(format="%"),
+                ),
+                color=alt.Color(
+                    "series:N",
+                    title="",
+                    scale=alt.Scale(
+                        domain=[
+                            "Long hit rate (>0%)",
+                            "Short hit rate (<0%)",
+                        ],
+                        range=["#2980b9", "#8e44ad"],
+                    ),
+                ),
+                tooltip=[
+                    alt.Tooltip("series:N", title="Metric"),
+                    alt.Tooltip("top_k:Q", title="K size"),
+                    alt.Tooltip("value:Q", title="Value", format=".2%"),
+                ],
+            )
+        )
+        st.altair_chart(hits_chart.interactive(), use_container_width=True)
+    else:
+        st.info("Performance lines populate once realized returns are available.")
+
     if price_mode == "live":
         table_phrase = "returns from open → latest"
     elif price_mode in {"historical_api", "upload"}:
         table_phrase = "returns from open → close"
     else:
         table_phrase = "returns (pending data)"
-    st.subheader(f"Top predictions ({table_phrase})")
+    st.subheader(f"Rank vs realized returns ({table_phrase})")
+    if not chart_data.empty:
+        scatter = (
+            alt.Chart(chart_data)
+            .mark_circle(size=70, opacity=0.75)
+            .encode(
+                x=alt.X("rank:Q", title="Model rank (1 = best)", scale=alt.Scale(zero=False)),
+                y=alt.Y(
+                    "return_open_to_now:Q",
+                    title="Realized return (open→now)",
+                    axis=alt.Axis(format="%"),
+                ),
+                color=alt.Color(
+                    "return_direction:N",
+                    title="Return direction",
+                    scale=alt.Scale(domain=["Positive", "Negative"], range=["#2ecc71", "#e74c3c"]),
+                ),
+                tooltip=[
+                    alt.Tooltip("ticker:N", title="Ticker"),
+                    alt.Tooltip("prediction:Q", title="Prediction", format=".4f"),
+                    alt.Tooltip("return_open_to_now:Q", title="Return", format=".2%"),
+                    alt.Tooltip("rank:Q", title="Rank"),
+                ],
+            )
+        )
+
+        rolling = (
+            alt.Chart(chart_data)
+            .transform_window(
+                rolling_mean="mean(return_open_to_now)",
+                sort=[{"field": "rank"}],
+                frame=[-5, 5],
+            )
+            .mark_line(color="#34495e", strokeWidth=2)
+            .encode(
+                x=alt.X("rank:Q"),
+                y=alt.Y("rolling_mean:Q", title="Rolling mean"),
+            )
+        )
+
+        st.altair_chart((scatter + rolling).interactive(), use_container_width=True)
+    else:
+        st.info("Waiting for realized returns to plot.")
+    st.subheader("Ranked predictions table")
     st.dataframe(show, use_container_width=True, height=650)
 
 with right:
     st.subheader("Summary")
     st.metric("Session date (ET)", str(session_date))
     st.metric("Symbols shown", f"{show.shape[0]:,}")
-    if df_view["return_open_to_now"].notna().any():
-        realized_scope = df_view[df_view["return_open_to_now"].notna()]
-        if not realized_scope.empty:
-            top_slice = realized_scope.head(min(int(summary_topk), len(realized_scope)))
-            bottom_slice = realized_scope.tail(min(int(summary_bottomk), len(realized_scope)))
-
-            top_mean = top_slice["return_open_to_now"].mean()
-            bottom_mean = bottom_slice["return_open_to_now"].mean()
-
-            st.metric(
-                f"Mean return of Top-{len(top_slice)}",
-                f"{top_mean * 100:.2f}%",
-            )
-            st.metric(
-                f"Mean return of Bottom-{len(bottom_slice)}",
-                f"{bottom_mean * 100:.2f}%",
-            )
+    st.metric("Symbols with realized returns", f"{len(returns_ready_sorted):,}")
+    if not returns_ready_sorted.empty:
+        st.metric("Average realized return", _fmt_pct_display(avg_return_all))
+        st.metric(
+            f"Top-{top_k_count or summary_topk} mean return",
+            _fmt_pct_display(top_mean),
+        )
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} mean short P&L",
+            _fmt_pct_display(bottom_short_mean),
+        )
+        st.metric("Equal-weight long–short spread", _fmt_pct_display(long_short_spread))
+        st.metric(
+            f"Top-{top_k_count or summary_topk} hit rate",
+            _fmt_pct_display(top_win_rate),
+        )
+        st.metric(
+            f"Bottom-{bottom_k_count or summary_bottomk} short hit rate (<0%)",
+            _fmt_pct_display(bottom_win_rate),
+        )
 
     if price_mode == "live":
         total = len(symbols_eod)
@@ -925,19 +1407,101 @@ with met_left:
     metrics_scope = "today" if price_mode == "live" and is_today_session else str(session_date)
     st.subheader(f"🧪 Robust rank⇄return metrics ({metrics_scope})")
     if not metrics_tbl.empty:
-        st.dataframe(metrics_tbl, use_container_width=True, height=330)
+        st.caption(
+            "Focus splits long/short/aggregate views; **Better ↗︎** is a quick tooltip on which way you want each metric to move."
+        )
+        st.dataframe(
+            metrics_tbl,
+            use_container_width=True,
+            height=330,
+            column_config={
+                "Better ↗︎": st.column_config.TextColumn(
+                    "Better ↗︎",
+                    help="Directionally helpful move for that metric (e.g., higher, more negative).",
+                    disabled=True,
+                )
+            },
+        )
+        with st.expander("How to read these numbers", expanded=False):
+            st.markdown(
+                """
+                **Correlations (Spearman/Kendall/Pearson)** — +1 is perfect rank↔return alignment, 0 is random, −1 is inverted.
+                Daily open→now data is noisy, so sustained readings above ~0.20 usually indicate meaningful skill.
+
+                **Slope & bps/10 ranks** — positive values mean returns improve as rank gets better. Values near zero imply
+                little payoff for reordering; +10 bps per 10 ranks means a 10-place improvement is worth ~0.10%.
+
+                **Bucket medians & win rates** — long medians/win rates should trend positive and short medians translate
+                into positive short P&L (i.e., underlying returns negative). A long–short spread above 0 and win rates
+                above 55–60% are typical of a healthy day.
+
+                **Ranking scores (NDCG/MAP/Precision)** — all live in [0, 1]. Higher means more positive-return ideas surfaced
+                near the top. 0.5 is “coin flip” behaviour; >0.7 usually reflects strong signal for the current session.
+                """
+            )
     else:
         st.info("Metrics unavailable (no non-NA returns yet).")
 
 with met_right:
     st.subheader("Rank deciles → median returns")
     if not deciles_tbl.empty:
+        if not deciles_chart_data.empty:
+            decile_chart = (
+                alt.Chart(deciles_chart_data)
+                .mark_bar(color="#3498db", opacity=0.7)
+                .encode(
+                    x=alt.X("rank_decile:N", title="Rank decile"),
+                    y=alt.Y("median_return:Q", title="Median return", axis=alt.Axis(format="%")),
+                    tooltip=[
+                        alt.Tooltip("rank_decile:N", title="Decile"),
+                        alt.Tooltip("median_return:Q", title="Median return", format=".2%"),
+                        alt.Tooltip("count:Q", title="Count"),
+                    ],
+                )
+            )
+            decile_line = (
+                alt.Chart(deciles_chart_data)
+                .mark_line(color="#2c3e50", point=alt.OverlayMarkDef(filled=True, color="#2c3e50"))
+                .encode(
+                    x="rank_decile:N",
+                    y=alt.Y("median_return:Q", axis=alt.Axis(format="%")),
+                )
+            )
+            st.altair_chart(decile_chart + decile_line, use_container_width=True)
         # Format and show decile medians to visualize monotonicity
         deciles_fmt = deciles_tbl.copy()
         deciles_fmt["median_return"] = deciles_fmt["median_return"].apply(_fmt_pct)
         st.dataframe(deciles_fmt, use_container_width=True, height=330)
     else:
         st.info("Decile table unavailable (insufficient rows).")
+
+if not baseline_ranked.empty:
+    st.write("---")
+    base_left, base_right = st.columns([2, 3], gap="large")
+    with base_left:
+        st.subheader("Baseline comparison")
+        st.caption("How the current ranking differs from the reference model.")
+        if not baseline_overlap_tbl.empty:
+            st.markdown("**Overlap & coverage**")
+            st.dataframe(baseline_overlap_tbl, use_container_width=True, height=240)
+        if not baseline_corr_tbl.empty:
+            st.markdown("**Rank / score correlations**")
+            st.dataframe(baseline_corr_tbl, use_container_width=True, height=150)
+    with base_right:
+        st.subheader("Largest rank moves vs baseline")
+        shifts_up_col, shifts_down_col = st.columns(2, gap="medium")
+        with shifts_up_col:
+            st.markdown("⬆️ Improved placement")
+            if not baseline_shift_up.empty:
+                st.dataframe(baseline_shift_up, use_container_width=True, height=230)
+            else:
+                st.info("No overlapping symbols yet.")
+        with shifts_down_col:
+            st.markdown("⬇️ Dropped placement")
+            if not baseline_shift_down.empty:
+                st.dataframe(baseline_shift_down, use_container_width=True, height=230)
+            else:
+                st.info("No overlapping symbols yet.")
 
 # Download
 csv_buf = io.StringIO()

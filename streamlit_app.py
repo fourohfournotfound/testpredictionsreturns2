@@ -73,6 +73,12 @@ DEFAULT_PREDICTIONS_PATHS = [
     "/mnt/data/live_predictions.csv",
 ]
 
+DEFAULT_BASELINE_PATHS = [
+    os.environ.get("BASELINE_PREDICTIONS_CSV", "").strip() or "",
+    "baseline_predictions.csv",
+    "/mnt/data/baseline_predictions.csv",
+]
+
 # -----------------------
 # Secrets / env
 # -----------------------
@@ -120,6 +126,26 @@ with st.sidebar:
     else:
         upload_file = st.file_uploader("Upload CSV", type=["csv"])
         preds_path = None
+
+    st.write("**Baseline model (optional)**")
+    baseline_mode = st.radio("Load baseline from…", ["None", "Local path", "Upload"], index=0)
+    baseline_path = None
+    baseline_upload_file = None
+    if baseline_mode == "Local path":
+        default_baseline = next((p for p in DEFAULT_BASELINE_PATHS if p and os.path.exists(p)), DEFAULT_BASELINE_PATHS[0] or "baseline_predictions.csv")
+        baseline_path = st.text_input(
+            "Baseline CSV path",
+            value=default_baseline,
+            help="Optional: point to a reference model's CSV (same columns as primary predictions).",
+            key="baseline_path_input",
+        )
+    elif baseline_mode == "Upload":
+        baseline_upload_file = st.file_uploader(
+            "Upload baseline CSV",
+            type=["csv"],
+            key="baseline_upload",
+            help="Optional: upload a reference model's predictions for comparison.",
+        )
 
     # Session date
     st.write("**Session date**")
@@ -513,12 +539,50 @@ if preds.empty:
     st.stop()
 
 # Filter to session & rank
+baseline_preds = pd.DataFrame(columns=["ticker", "prediction"])
+baseline_ranked_full = pd.DataFrame()
+baseline_available = False
+baseline_overlap_stats = {}
+baseline_corr_df = pd.DataFrame()
+baseline_top_movers_display = pd.DataFrame()
+
+if baseline_mode == "Upload" and baseline_upload_file is not None:
+    baseline_preds = _load_predictions_from_upload(baseline_upload_file)
+elif baseline_mode == "Local path" and baseline_path:
+    if os.path.exists(baseline_path):
+        baseline_preds = _load_predictions_from_path(baseline_path)
+    else:
+        st.warning(f"Baseline path not found: {baseline_path}")
+
 preds = _align_and_filter_for_session(preds, session_date)
-preds_ranked = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
-preds_ranked["rank"] = np.arange(1, len(preds_ranked) + 1)
-preds_ranked = preds_ranked.head(int(top_n))
+preds_ranked_full = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
+preds_ranked_full["rank"] = np.arange(1, len(preds_ranked_full) + 1)
+preds_ranked_full["ticker"] = preds_ranked_full["ticker"].astype(str).str.upper().str.strip()
+preds_ranked_full_guarded = _post_asof_guard(preds_ranked_full.copy(), session_open, require_asof_guard=require_asof_guard)
+preds_ranked = preds_ranked_full.head(int(top_n)).copy()
 preds_ranked["ticker"] = preds_ranked["ticker"].astype(str).str.upper().str.strip()
 st.caption(f"📐 Ranked predictions shape (after top-N): {preds_ranked.shape}")
+
+if not baseline_preds.empty:
+    st.caption(f"📐 Baseline predictions shape after normalization: {baseline_preds.shape}")
+    baseline_preds = _align_and_filter_for_session(baseline_preds, session_date)
+    baseline_preds = _post_asof_guard(baseline_preds, session_open, require_asof_guard=require_asof_guard)
+    baseline_ranked_full = baseline_preds.sort_values("prediction", ascending=False).reset_index(drop=True)
+    if not baseline_ranked_full.empty:
+        baseline_ranked_full["rank_baseline"] = np.arange(1, len(baseline_ranked_full) + 1)
+        baseline_ranked_full = baseline_ranked_full.rename(columns={"prediction": "prediction_baseline"})
+        baseline_available = True
+    else:
+        st.info("Baseline file has no rows after session/as_of filtering.")
+
+if baseline_available:
+    preds_ranked = preds_ranked.merge(
+        baseline_ranked_full[["ticker", "prediction_baseline", "rank_baseline"]],
+        on="ticker",
+        how="left",
+    )
+    preds_ranked["rank_delta"] = preds_ranked["rank_baseline"] - preds_ranked["rank"]
+    preds_ranked["abs_rank_delta"] = preds_ranked["rank_delta"].abs()
 
 # Session guard
 preds_ranked = _post_asof_guard(preds_ranked, session_open, require_asof_guard=require_asof_guard)
@@ -652,10 +716,16 @@ def _fmt_pct(x):   return "" if pd.isna(x) else f"{x*100:.2f}%"
 def _fmt_price(x): return "" if pd.isna(x) else f"{x:.2f}"
 
 display_cols = ["rank", "ticker", "prediction", "open_today", "last_price", "return_open_to_now"]
+if baseline_available:
+    display_cols.extend(["rank_baseline", "prediction_baseline", "rank_delta"])
 show = df_view[display_cols].copy()
 show["open_today"] = show["open_today"].apply(_fmt_price)
 show["last_price"] = show["last_price"].apply(_fmt_price)
 show["return_open_to_now"] = show["return_open_to_now"].apply(_fmt_pct)
+if baseline_available:
+    show["rank_baseline"] = show["rank_baseline"].apply(lambda x: "" if pd.isna(x) else f"{int(x)}")
+    show["prediction_baseline"] = show["prediction_baseline"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.4f}")
+    show["rank_delta"] = show["rank_delta"].apply(lambda x: "" if pd.isna(x) else f"{int(x):+d}")
 
 if price_mode == "live":
     open_label = "Open (today)"
@@ -823,6 +893,87 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
 
 metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_tail_pct)
 
+if baseline_available:
+    visible_top_n = preds_ranked.shape[0]
+    baseline_top_n_df = baseline_ranked_full.head(int(top_n)).copy()
+    baseline_top_n_df["ticker"] = baseline_top_n_df["ticker"].astype(str).str.upper().str.strip()
+    top_n_set_new = set(preds_ranked["ticker"].tolist())
+    top_n_set_base = set(baseline_top_n_df["ticker"].tolist())
+    overlap_top_n = len(top_n_set_new & top_n_set_base)
+    new_top_k_df = preds_ranked.head(int(min(metrics_topk, max(0, visible_top_n)))).copy()
+    new_top_k_size = new_top_k_df.shape[0]
+    baseline_top_k_df = baseline_ranked_full.head(int(metrics_topk)).copy()
+    baseline_top_k_df["ticker"] = baseline_top_k_df["ticker"].astype(str).str.upper().str.strip()
+    top_k_set_new = set(new_top_k_df["ticker"].tolist())
+    top_k_set_base = set(baseline_top_k_df["ticker"].tolist())
+    overlap_top_k = len(top_k_set_new & top_k_set_base)
+
+    rank_delta_series = preds_ranked.get("rank_delta")
+    improved = int((rank_delta_series > 0).sum()) if rank_delta_series is not None else 0
+    worsened = int((rank_delta_series < 0).sum()) if rank_delta_series is not None else 0
+    unchanged = int((rank_delta_series == 0).sum()) if rank_delta_series is not None else 0
+    median_abs_delta = float(preds_ranked.get("abs_rank_delta", pd.Series(dtype=float)).median()) if "abs_rank_delta" in preds_ranked else np.nan
+
+    baseline_overlap_stats = {
+        "visible_top_n": visible_top_n,
+        "baseline_top_n": baseline_top_n_df.shape[0],
+        "overlap_top_n": overlap_top_n,
+        "overlap_top_n_pct": overlap_top_n / max(1, visible_top_n),
+        "new_top_k_size": new_top_k_size,
+        "baseline_top_k": baseline_top_k_df.shape[0],
+        "overlap_top_k": overlap_top_k,
+        "overlap_top_k_pct": overlap_top_k / max(1, new_top_k_size),
+        "improved": improved,
+        "worsened": worsened,
+        "unchanged": unchanged,
+        "median_abs_delta": median_abs_delta,
+    }
+
+    joined_full = preds_ranked_full_guarded.merge(
+        baseline_ranked_full[["ticker", "prediction_baseline", "rank_baseline"]],
+        on="ticker",
+        how="inner",
+    )
+    if not joined_full.empty:
+        spearman_pred = _spearman_corr(joined_full["prediction"], joined_full["prediction_baseline"])
+        pearson_pred = _pearson_corr(joined_full["prediction"], joined_full["prediction_baseline"])
+        spearman_rank = _spearman_corr(joined_full["rank"], joined_full["rank_baseline"])
+        kendall_rank = _kendall_tau_b(joined_full["rank"], joined_full["rank_baseline"])
+        corr_rows = [
+            ("Spearman ρ (predictions)", f"{spearman_pred:.3f}" if pd.notna(spearman_pred) else "—"),
+            ("Pearson r (predictions)", f"{pearson_pred:.3f}" if pd.notna(pearson_pred) else "—"),
+            ("Spearman ρ (ranks)", f"{spearman_rank:.3f}" if pd.notna(spearman_rank) else "—"),
+            ("Kendall τ-b (ranks)", f"{kendall_rank:.3f}" if pd.notna(kendall_rank) else "—"),
+        ]
+        baseline_corr_df = pd.DataFrame(corr_rows, columns=["stat", "value"])
+    else:
+        baseline_corr_df = pd.DataFrame(columns=["stat", "value"])
+
+    movers = preds_ranked.dropna(subset=["rank_baseline"]).copy()
+    if not movers.empty:
+        movers = movers.sort_values("abs_rank_delta", ascending=False).head(10)
+        movers_display = movers[[
+            "ticker",
+            "rank",
+            "rank_baseline",
+            "rank_delta",
+            "prediction",
+            "prediction_baseline",
+        ]].copy()
+        for col in ["rank", "rank_baseline", "rank_delta"]:
+            movers_display[col] = movers_display[col].astype(int)
+        movers_display["prediction"] = movers_display["prediction"].astype(float)
+        movers_display["prediction_baseline"] = movers_display["prediction_baseline"].astype(float)
+        movers_display = movers_display.rename(columns={
+            "ticker": "Ticker",
+            "rank": "New rank",
+            "rank_baseline": "Baseline rank",
+            "rank_delta": "Δ rank (baseline − new)",
+            "prediction": "Prediction",
+            "prediction_baseline": "Baseline prediction",
+        })
+        baseline_top_movers_display = movers_display.reset_index(drop=True)
+
 # -----------------------
 # UI
 # -----------------------
@@ -899,6 +1050,57 @@ with right:
                 f"Mean return of Bottom-{len(bottom_slice)}",
                 f"{bottom_mean * 100:.2f}%",
             )
+
+    if baseline_available and baseline_overlap_stats:
+        st.write(" ")
+        st.subheader("Baseline comparison")
+        top_col, bottom_col = st.columns(2)
+        top_n_den = baseline_overlap_stats.get("visible_top_n", 0)
+        overlap_top_n = baseline_overlap_stats.get("overlap_top_n", 0)
+        pct_top_n = baseline_overlap_stats.get("overlap_top_n_pct", 0.0) * 100.0 if top_n_den else None
+        if top_n_den:
+            top_col.metric(
+                f"Top-{top_n_den} overlap",
+                f"{overlap_top_n} / {top_n_den}",
+                delta=f"{pct_top_n:.1f}% share",
+            )
+        else:
+            top_col.metric("Top-N overlap", "0", delta="—")
+
+        top_k_den = baseline_overlap_stats.get("new_top_k_size", 0)
+        overlap_top_k = baseline_overlap_stats.get("overlap_top_k", 0)
+        pct_top_k = baseline_overlap_stats.get("overlap_top_k_pct", 0.0) * 100.0 if top_k_den else None
+        if top_k_den:
+            bottom_col.metric(
+                f"Top-{top_k_den} overlap (K)",
+                f"{overlap_top_k} / {top_k_den}",
+                delta=f"{pct_top_k:.1f}% share",
+            )
+        else:
+            bottom_col.metric("Top-K overlap", "0", delta="—")
+
+        improved = baseline_overlap_stats.get("improved", 0)
+        worsened = baseline_overlap_stats.get("worsened", 0)
+        unchanged = baseline_overlap_stats.get("unchanged", 0)
+        median_abs_delta = baseline_overlap_stats.get("median_abs_delta", np.nan)
+        summary_bits = [
+            f"⬆️ improved: {improved}",
+            f"⬇️ worsened: {worsened}",
+            f"⏸ unchanged: {unchanged}",
+        ]
+        if pd.notna(median_abs_delta):
+            summary_bits.append(f"median |Δ rank|: {median_abs_delta:.1f}")
+        st.caption("; ".join(summary_bits))
+
+        if not baseline_corr_df.empty:
+            st.write("Correlation vs. baseline")
+            st.dataframe(baseline_corr_df, use_container_width=True, height=170)
+
+        st.write("Largest rank shifts vs. baseline")
+        if not baseline_top_movers_display.empty:
+            st.dataframe(baseline_top_movers_display, use_container_width=True, height=280)
+        else:
+            st.info("No overlapping tickers to compare ranks yet.")
 
     if price_mode == "live":
         total = len(symbols_eod)

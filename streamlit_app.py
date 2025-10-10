@@ -745,11 +745,22 @@ chart_data = (
     .copy()
 )
 if not chart_data.empty:
-    chart_data["return_direction"] = np.where(
-        chart_data["return_open_to_now"] >= 0,
-        "Positive",
-        "Negative",
-    )
+    if pd.notna(benchmark_return):
+        outperform_label = "Outperform (≥ benchmark)"
+        underperform_label = "Underperform (< benchmark)"
+        chart_data["return_direction"] = np.where(
+            chart_data["return_open_to_now"] >= benchmark_return,
+            outperform_label,
+            underperform_label,
+        )
+    else:
+        outperform_label = "Positive return"
+        underperform_label = "Negative return"
+        chart_data["return_direction"] = np.where(
+            chart_data["return_open_to_now"] >= 0,
+            outperform_label,
+            underperform_label,
+        )
     chart_data.sort_values("rank", inplace=True)
 
 
@@ -981,7 +992,9 @@ def _theil_sen_slope_via_deciles(x: pd.Series, y: pd.Series, bins: int = 10) -> 
             slopes.extend((dy[valid] / dx[valid]).tolist())
     return float(np.median(slopes)) if slopes else np.nan
 
-def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _compute_rank_metrics(
+    df: pd.DataFrame, topk: int, winsor_pct: int, benchmark: float
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Compute robust rank↔return metrics; returns (metrics_table, deciles_table)."""
     ready = df[["rank", "prediction", "return_open_to_now"]].dropna().copy()
     st.caption(f"📐 Metrics-ready rows (after NA drop): {ready.shape}")
@@ -991,7 +1004,11 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
 
     # Use negative rank so "higher is better" for correlation orientation
     ready["neg_rank"] = -ready["rank"].astype(float)
-    ready["relevance"] = pd.to_numeric(ready["return_open_to_now"], errors="coerce").clip(lower=0)
+    returns_numeric = pd.to_numeric(ready["return_open_to_now"], errors="coerce")
+    if pd.notna(benchmark):
+        ready["relevance"] = (returns_numeric - benchmark).clip(lower=0)
+    else:
+        ready["relevance"] = returns_numeric.clip(lower=0)
 
     # Winsorize returns for Pearson-style only (Spearman/Kendall are rank-based)
     p = max(0.0, min(0.5, float(winsor_pct) / 100.0))
@@ -1018,8 +1035,16 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
         if pd.notna(top_med) and pd.notna(bot_med_short)
         else np.nan
     )
-    top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
-    bot_win = float((bot["return_open_to_now"] < 0).mean()) if not bot.empty else np.nan
+    top_win = (
+        float(_long_hit_mask(top["return_open_to_now"], benchmark).mean())
+        if not top.empty
+        else np.nan
+    )
+    bot_win = (
+        float(_short_hit_mask(bot["return_open_to_now"], benchmark).mean())
+        if not bot.empty
+        else np.nan
+    )
 
     # Ranking metrics @K (Top-K by predicted rank)
     ready_sorted = ready.sort_values("rank")
@@ -1034,7 +1059,9 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
         ideal_dcg = float(np.sum(ideal_gains))
         ndcg_k = float(dcg / ideal_dcg) if ideal_dcg > 0 else np.nan
 
-        hits = (ready_sorted["return_open_to_now"].to_numpy()[:k_rank] > 0)
+        hits = _long_hit_mask(
+            pd.Series(ready_sorted["return_open_to_now"].to_numpy()[:k_rank]), benchmark
+        ).to_numpy()
         precision_k = float(hits.mean()) if k_rank > 0 else np.nan
         cum_hits = np.cumsum(hits)
         precisions = cum_hits / (np.arange(1, k_rank + 1))
@@ -1059,11 +1086,31 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
             "↑ more positive",
         ),
         ("Spread", f"Median long–short (Top-{k} + Short-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—", "↑ wider"),
-        ("Long bucket", f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—", "↑ toward 100%"),
-        ("Short bucket", f"Bottom-{k} win rate (<0%)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—", "↑ toward 100%"),
+        (
+            "Long bucket",
+            f"Top-{k} win rate (> benchmark)",
+            f"{top_win*100:.1f}%" if pd.notna(top_win) else "—",
+            "↑ toward 100%",
+        ),
+        (
+            "Short bucket",
+            f"Bottom-{k} win rate (< benchmark)",
+            f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—",
+            "↑ toward 100%",
+        ),
         ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—", "↑ toward 1"),
-        ("Top-K", f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—", "↑ toward 1"),
-        ("Top-K", f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—", "↑ toward 100%"),
+        (
+            "Top-K",
+            f"MAP@{k_rank} (> benchmark returns as relevant)",
+            f"{map_k:.3f}" if pd.notna(map_k) else "—",
+            "↑ toward 1",
+        ),
+        (
+            "Top-K",
+            f"Precision@{k_rank} (> benchmark returns)",
+            f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—",
+            "↑ toward 100%",
+        ),
     ]
     metrics_tbl = pd.DataFrame(metrics_rows, columns=["Focus", "Metric", "Value", "Better ↗︎"])
 
@@ -1081,7 +1128,9 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     deciles.rename(columns={"bucket": f"rank_decile(1=best, D={deciles.shape[0]})"}, inplace=True)
     return metrics_tbl, deciles
 
-metrics_tbl, deciles_tbl = _compute_rank_metrics(df_view, metrics_topk, winsor_tail_pct)
+metrics_tbl, deciles_tbl = _compute_rank_metrics(
+    df_view, metrics_topk, winsor_tail_pct, benchmark_return
+)
 
 deciles_chart_data = pd.DataFrame()
 if deciles_tbl is not None and not deciles_tbl.empty:
@@ -1349,8 +1398,11 @@ with left:
                 ),
                 color=alt.Color(
                     "return_direction:N",
-                    title="Return direction",
-                    scale=alt.Scale(domain=["Positive", "Negative"], range=["#2ecc71", "#e74c3c"]),
+                    title="Return vs benchmark" if pd.notna(benchmark_return) else "Return direction",
+                    scale=alt.Scale(
+                        domain=[outperform_label, underperform_label],
+                        range=["#2ecc71", "#e74c3c"],
+                    ),
                 ),
                 tooltip=[
                     alt.Tooltip("ticker:N", title="Ticker"),
@@ -1374,8 +1426,29 @@ with left:
                 y=alt.Y("rolling_mean:Q", title="Rolling mean"),
             )
         )
+        layers = scatter + rolling
+        if pd.notna(benchmark_return):
+            benchmark_line = (
+                alt.Chart(
+                    pd.DataFrame(
+                        {
+                            "label": ["Equal-weight benchmark"],
+                            "benchmark": [benchmark_return],
+                        }
+                    )
+                )
+                .mark_rule(color="#f1c40f", strokeDash=[6, 4])
+                .encode(
+                    y=alt.Y("benchmark:Q"),
+                    tooltip=[
+                        alt.Tooltip("label:N", title=""),
+                        alt.Tooltip("benchmark:Q", title="Benchmark", format=".2%"),
+                    ],
+                )
+            )
+            layers = layers + benchmark_line
 
-        st.altair_chart((scatter + rolling).interactive(), use_container_width=True)
+        st.altair_chart(layers.interactive(), use_container_width=True)
     else:
         st.info("Waiting for realized returns to plot.")
     st.subheader("Ranked predictions table")

@@ -195,7 +195,7 @@ with st.sidebar:
         max_value=int(min(200, max(5, top_n))),
         value=int(min(20, top_n)),
         step=5,
-        help="Applies to Top/Bottom median returns and Top-K win rate."
+        help="Applies to Top/Bottom median returns, Top-K win rate, and ranking metrics (Precision@K / MAP@K / NDCG@K)."
     )
     winsor_tail_pct = st.slider(
         "Winsorize tails of 'return_open_to_now' (%) for metrics",
@@ -786,6 +786,7 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
 
     # Use negative rank so "higher is better" for correlation orientation
     ready["neg_rank"] = -ready["rank"].astype(float)
+    ready["relevance"] = pd.to_numeric(ready["return_open_to_now"], errors="coerce").clip(lower=0)
 
     # Winsorize returns for Pearson-style only (Spearman/Kendall are rank-based)
     p = max(0.0, min(0.5, float(winsor_pct) / 100.0))
@@ -809,6 +810,30 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
     l_s_med = top_med - bot_med if pd.notna(top_med) and pd.notna(bot_med) else np.nan
     top_win = float((top["return_open_to_now"] > 0).mean()) if not top.empty else np.nan
 
+    # Ranking metrics @K (Top-K by predicted rank)
+    ready_sorted = ready.sort_values("rank")
+    k_rank = int(max(1, min(topk, ready_sorted.shape[0])))
+    rel = ready_sorted["relevance"].to_numpy()[:k_rank]
+    if k_rank > 0:
+        discounts = 1.0 / np.log2(np.arange(2, k_rank + 2))
+        gains = (np.power(2.0, rel) - 1.0) * discounts
+        dcg = float(np.sum(gains))
+        ideal_rel = np.sort(ready_sorted["relevance"].to_numpy())[::-1][:k_rank]
+        ideal_gains = (np.power(2.0, ideal_rel) - 1.0) * discounts
+        ideal_dcg = float(np.sum(ideal_gains))
+        ndcg_k = float(dcg / ideal_dcg) if ideal_dcg > 0 else np.nan
+
+        hits = (ready_sorted["return_open_to_now"].to_numpy()[:k_rank] > 0)
+        precision_k = float(hits.mean()) if k_rank > 0 else np.nan
+        cum_hits = np.cumsum(hits)
+        precisions = cum_hits / (np.arange(1, k_rank + 1))
+        relevant_total = int(hits.sum())
+        map_k = float(np.sum(precisions * hits) / relevant_total) if relevant_total > 0 else 0.0
+    else:
+        ndcg_k = np.nan
+        precision_k = np.nan
+        map_k = np.nan
+
     metrics_rows = [
         ("Spearman ρ (−rank vs return)", f"{spearman:.3f}" if pd.notna(spearman) else "—"),
         ("Kendall τ-b (−rank vs return)", f"{kendall:.3f}" if pd.notna(kendall) else "—"),
@@ -820,6 +845,11 @@ def _compute_rank_metrics(df: pd.DataFrame, topk: int, winsor_pct: int) -> Tuple
         (f"Median long–short (Top-{k} − Bottom-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—"),
         (f"Top-{k} win rate (>0%)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—"),
     ]
+    metrics_rows.extend([
+        (f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—"),
+        (f"MAP@{k_rank} (>0% returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—"),
+        (f"Precision@{k_rank} (>0% returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—"),
+    ])
     metrics_tbl = pd.DataFrame(metrics_rows, columns=["metric", "value"])
 
     # Deciles by rank: 1 (best) → D (worst)

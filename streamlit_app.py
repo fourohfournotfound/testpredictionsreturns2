@@ -80,6 +80,12 @@ DEFAULT_BASELINE_PATHS = [
     "/mnt/data/baseline_predictions.csv",
 ]
 
+DEFAULT_SHARADAR_PATHS = [
+    os.environ.get("SHARADAR_DAILY_CSV", "").strip() or "",
+    "sharadar_sep.csv",
+    "/mnt/data/sharadar_sep.csv",
+]
+
 # -----------------------
 # Secrets / env
 # -----------------------
@@ -143,10 +149,7 @@ with st.sidebar:
     elif baseline_src == "Upload":
         baseline_upload = st.file_uploader("Upload baseline CSV", type=["csv"], key="baseline_upload")
 
-    # Session date
-    st.write("**Session date**")
     today_ny = datetime.now(tz=NY).date()
-    session_date = st.date_input("Target trading session (ET)", value=today_ny)
 
     # Price sourcing
     st.write("**Price data source**")
@@ -156,6 +159,7 @@ with st.sidebar:
             "Auto (live today, historical API otherwise)",
             "Force live (today only)",
             "Historical via EODHD API",
+            "Sharadar daily (local CSV)",
             "Upload daily OHLCV",
         ),
         help=(
@@ -164,6 +168,8 @@ with st.sidebar:
         ),
     )
 
+    sharadar_path = None
+    sharadar_upload = None
     uploaded_ohlcv_file = None
     if price_source == "Upload daily OHLCV":
         uploaded_ohlcv_file = st.file_uploader(
@@ -171,6 +177,47 @@ with st.sidebar:
             type=["csv"],
             help="Expect columns like ticker/date/open/close. MultiIndex CSVs are also supported.",
         )
+    elif price_source == "Sharadar daily (local CSV)":
+        default_sharadar = next(
+            (p for p in DEFAULT_SHARADAR_PATHS if p and os.path.exists(p)),
+            DEFAULT_SHARADAR_PATHS[0] or "sharadar_sep.csv",
+        )
+        sharadar_path = st.text_input(
+            "Sharadar CSV path",
+            value=default_sharadar,
+            help=(
+                "Path to a Sharadar SEP-style daily prices CSV (needs ticker/date/open/high/low/close/volume). "
+                "Upload a slice instead if the full file is too large."
+            ),
+        )
+        sharadar_upload = st.file_uploader(
+            "Or upload Sharadar daily CSV",
+            type=["csv"],
+            key="sharadar_upload",
+        )
+
+    st.write("**Return horizon**")
+    horizon_options = {
+        "next_open_to_close": "Next session: open → close",
+        "next_open_to_open": "Next session: open → following open",
+        "same_session": "Same session: open → close",
+    }
+    return_horizon = st.selectbox(
+        "Evaluate realized returns using…",
+        list(horizon_options.keys()),
+        index=0,
+        format_func=lambda k: horizon_options[k],
+        help=(
+            "Default = trade on the next day at the open and exit at the close."
+            " Choose open→open for overnight holds or same-session for intraday."
+        ),
+    )
+
+    st.write("**Trading session**")
+    session_picker = st.empty()
+    st.caption(
+        "Prediction dates appear here once a CSV is loaded. We pick the latest by default."
+    )
 
     # Symbol format
     st.write("**Symbol format**")
@@ -256,6 +303,17 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     date_col   = next((cols[k] for k in cols if k in ["date", "session_date", "target_date"]), None)
     asof_col   = next((cols[k] for k in cols if k in ["as_of", "asof", "timestamp", "prediction_time"]), None)
 
+    if ticker_col is None and date_col is not None:
+        wide_value_cols = [c for c in df.columns if c != date_col]
+        if wide_value_cols:
+            melted = df.melt(
+                id_vars=[date_col],
+                value_vars=wide_value_cols,
+                var_name="ticker",
+                value_name="prediction",
+            )
+            return _normalize_predictions(melted)
+
     missing = []
     if ticker_col is None: missing.append("ticker")
     if pred_col is None:   missing.append("prediction")
@@ -282,6 +340,8 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
                 return pd.NaT
         out["as_of"] = out["as_of"].apply(_parse_asof)
         out = out.sort_values(["ticker", "as_of"]).groupby("ticker", as_index=False).tail(1)
+
+    out = out.dropna(subset=["prediction"])
 
     st.caption(f"📐 Predictions shape after normalization: {out.shape}")
     return out
@@ -332,6 +392,10 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 def _load_ohlcv_from_upload(upload: io.BytesIO) -> pd.DataFrame:
     return _normalize_ohlcv(pd.read_csv(upload))
 
+@st.cache_data(show_spinner=False)
+def _load_ohlcv_from_path(path: str) -> pd.DataFrame:
+    return _normalize_ohlcv(pd.read_csv(path))
+
 def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFrame:
     out = df.copy()
     if "date" in out.columns:
@@ -358,7 +422,24 @@ def _regular_session_bounds(session: date) -> Tuple[datetime, datetime]:
         NY.localize(datetime.combine(session, dt_time(16, 0))),
     )
 
-session_open, session_close = _regular_session_bounds(session_date)
+def _next_weekday(d: date) -> date:
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt
+
+def _shift_weekday(d: date, steps: int) -> date:
+    if steps == 0:
+        return d
+    direction = 1 if steps > 0 else -1
+    remaining = abs(steps)
+    current = d
+    while remaining > 0:
+        current += timedelta(days=direction)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
 now_et = datetime.now(tz=NY)
 
 # -----------------------
@@ -534,6 +615,42 @@ if preds.empty:
     st.info("Upload or point to your predictions CSV to get started. Expect columns like: `ticker`, `prediction`, optional `date`, optional `as_of`.")
     st.stop()
 
+prediction_date = None
+if "date" in preds.columns and preds["date"].notna().any():
+    available_dates = sorted(preds["date"].dropna().unique())
+    default_index = len(available_dates) - 1
+    with st.sidebar:
+        prediction_date = session_picker.selectbox(
+            "Prediction date",
+            options=available_dates,
+            index=default_index,
+            key="prediction_date_select",
+            format_func=lambda d: d.strftime("%Y-%m-%d"),
+        )
+else:
+    with st.sidebar:
+        prediction_date = session_picker.date_input(
+            "Prediction date",
+            value=today_ny,
+            key="prediction_date_manual",
+        )
+
+if isinstance(prediction_date, pd.Timestamp):
+    prediction_date = prediction_date.date()
+
+if not isinstance(prediction_date, date):
+    prediction_date = today_ny
+
+
+if return_horizon == "same_session":
+    session_date_guess = prediction_date
+else:
+    session_date_guess = _next_weekday(prediction_date)
+
+session_open_guess, session_close_guess = _regular_session_bounds(session_date_guess)
+session_open, session_close = session_open_guess, session_close_guess
+
+
 # Optional baseline predictions
 baseline = pd.DataFrame(columns=["ticker", "prediction"])
 baseline_ranked = pd.DataFrame()
@@ -550,7 +667,7 @@ if baseline_src != "None":
         st.warning(f"Failed to load baseline predictions: {e}")
 
 if not baseline.empty:
-    baseline = _align_and_filter_for_session(baseline, session_date)
+    baseline = _align_and_filter_for_session(baseline, prediction_date)
     baseline = _post_asof_guard(baseline, session_open, require_asof_guard=require_asof_guard)
     baseline_ranked = baseline.sort_values("prediction", ascending=False).reset_index(drop=True)
     baseline_ranked["baseline_rank"] = np.arange(1, len(baseline_ranked) + 1)
@@ -559,7 +676,7 @@ if not baseline.empty:
     st.caption(f"📐 Baseline predictions shape (after normalization): {baseline_ranked.shape}")
 
 # Filter to session & rank
-preds = _align_and_filter_for_session(preds, session_date)
+preds = _align_and_filter_for_session(preds, prediction_date)
 preds_ranked_full = preds.sort_values("prediction", ascending=False).reset_index(drop=True)
 preds_ranked_full["full_rank"] = np.arange(1, len(preds_ranked_full) + 1)
 preds_ranked_full["ticker"] = preds_ranked_full["ticker"].astype(str).str.upper().str.strip()
@@ -579,13 +696,15 @@ symbols_in = preds_ranked["ticker"].dropna().astype(str).str.upper().tolist()
 symbols_eod = [_to_eod_symbol(t, exchange_suffix) for t in symbols_in]
 symbols_eod_tuple = tuple(symbols_eod)  # for cache key stability
 
-is_today_session = session_date == today_ny
-is_past_session = session_date < today_ny
+is_today_session = session_date_guess == today_ny
+is_past_session = session_date_guess < today_ny
 
 if price_source == "Force live (today only)":
     price_mode = "live"
 elif price_source == "Historical via EODHD API":
     price_mode = "historical_api"
+elif price_source == "Sharadar daily (local CSV)":
+    price_mode = "sharadar"
 elif price_source == "Upload daily OHLCV":
     price_mode = "upload"
 else:
@@ -595,13 +714,54 @@ if price_mode == "live" and not is_today_session:
     st.warning("Live mode only supports today's session — falling back to historical daily bars.")
     price_mode = "historical_api"
 
+effective_horizon = return_horizon
+if price_mode == "live":
+    if return_horizon != "same_session":
+        st.info("Live mode is limited to same-session open→now returns; overriding the selected horizon.")
+    effective_horizon = "same_session"
+    session_date = prediction_date
+elif price_mode in {"historical_api", "upload", "sharadar"}:
+    if return_horizon == "same_session":
+        session_date = prediction_date
+    else:
+        session_date = _next_weekday(prediction_date)
+    effective_horizon = return_horizon
+else:
+    session_date = prediction_date
+
+entry_date = session_date
+exit_date = session_date
+if effective_horizon == "next_open_to_open":
+    exit_date = _next_weekday(entry_date)
+
+session_open, session_close = _regular_session_bounds(session_date)
+
+is_today_session = session_date == today_ny
+is_past_session = session_date < today_ny
+
+if session_open != session_open_guess:
+    preds_ranked = _post_asof_guard(preds_ranked, session_open, require_asof_guard=require_asof_guard)
+    if preds_ranked.empty:
+        st.warning("No rows remain after enforcing the as_of guard for the active trading session.")
+        st.stop()
+
 ohlcv_upload_df = None
+sharadar_df = None
 if price_mode == "upload":
     if uploaded_ohlcv_file is None:
         st.info("Upload a daily OHLCV CSV to evaluate past sessions without API calls.")
         st.stop()
     ohlcv_upload_df = _load_ohlcv_from_upload(uploaded_ohlcv_file)
     st.caption(f"📐 Uploaded OHLCV shape after normalization: {ohlcv_upload_df.shape}")
+elif price_mode == "sharadar":
+    if sharadar_upload is not None:
+        sharadar_df = _load_ohlcv_from_upload(sharadar_upload)
+    elif sharadar_path and os.path.exists(sharadar_path):
+        sharadar_df = _load_ohlcv_from_path(sharadar_path)
+    else:
+        st.error("Sharadar CSV not found. Provide a valid path or upload a file.")
+        st.stop()
+    st.caption(f"📐 Sharadar daily rows (after normalization): {sharadar_df.shape}")
 
 # -----------------------
 # Price data assembly (live vs historical vs upload)
@@ -664,27 +824,76 @@ if price_mode == "live":
     df_view["last_price"] = df_view["eod_symbol"].map(last_series)
 
 elif price_mode == "historical_api":
-    hist = _historical_daily_bars(symbols_eod_tuple, session_date)
-    st.caption(f"📐 Historical EOD bars fetched: {hist.shape}")
-    if hist.empty:
-        st.warning("No historical bars returned for this session from EODHD.")
-    df_view["open_today"] = df_view["eod_symbol"].map(hist["open"] if "open" in hist.columns else pd.Series(dtype=float))
-    df_view["last_price"] = df_view["eod_symbol"].map(hist["close"] if "close" in hist.columns else pd.Series(dtype=float))
+    hist_entry = _historical_daily_bars(symbols_eod_tuple, entry_date)
+    hist_exit = hist_entry if exit_date == entry_date else _historical_daily_bars(symbols_eod_tuple, exit_date)
+    hist = hist_entry
+    st.caption(
+        f"📐 Historical EOD bars fetched: entry={hist_entry.shape}, exit={hist_exit.shape if exit_date != entry_date else hist_entry.shape}"
+    )
+    if hist_entry.empty:
+        st.warning("No historical bars returned for the entry session from EODHD.")
+    df_view["open_today"] = df_view["eod_symbol"].map(hist_entry["open"] if "open" in hist_entry.columns else pd.Series(dtype=float))
+    if effective_horizon == "next_open_to_open" and exit_date != entry_date:
+        df_view["last_price"] = df_view["eod_symbol"].map(
+            hist_exit["open"] if "open" in hist_exit.columns else pd.Series(dtype=float)
+        )
+    else:
+        close_series = hist_entry["close"] if "close" in hist_entry.columns else pd.Series(dtype=float)
+        df_view["last_price"] = df_view["eod_symbol"].map(close_series)
+
+elif price_mode == "sharadar":
+    entry_rows_all = sharadar_df[sharadar_df["date"] == entry_date]
+    st.caption(f"📐 Sharadar rows for entry {entry_date}: {entry_rows_all.shape}")
+    if entry_rows_all.empty:
+        st.warning("Sharadar CSV has no rows for the entry session date.")
+    entry_rows = entry_rows_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
+    df_view["open_today"] = df_view["base_ticker"].map(
+        entry_rows["open"] if "open" in entry_rows.columns else pd.Series(dtype=float)
+    )
+
+    if effective_horizon == "next_open_to_open" and exit_date != entry_date:
+        exit_rows_all = sharadar_df[sharadar_df["date"] == exit_date]
+        st.caption(f"📐 Sharadar rows for exit {exit_date}: {exit_rows_all.shape}")
+        exit_rows = exit_rows_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
+        df_view["last_price"] = df_view["base_ticker"].map(
+            exit_rows["open"] if "open" in exit_rows.columns else pd.Series(dtype=float)
+        )
+    else:
+        exit_rows = entry_rows
+        close_col = "close" if "close" in exit_rows.columns else None
+        if close_col is None and "adj_close" in exit_rows.columns:
+            close_col = "adj_close"
+        if close_col is None:
+            st.error("Sharadar CSV needs a 'close' or 'adj_close' column for returns.")
+            st.stop()
+        df_view["last_price"] = df_view["base_ticker"].map(exit_rows[close_col])
 
 elif price_mode == "upload":
-    session_rows_all = ohlcv_upload_df[ohlcv_upload_df["date"] == session_date]
-    st.caption(f"📐 Uploaded OHLCV rows for {session_date}: {session_rows_all.shape}")
-    if session_rows_all.empty:
-        st.warning("Uploaded OHLCV file has no rows for this session date.")
-    session_rows = session_rows_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
-    df_view["open_today"] = df_view["base_ticker"].map(session_rows["open"] if "open" in session_rows.columns else pd.Series(dtype=float))
-    close_col = "close" if "close" in session_rows.columns else None
-    if close_col is None and "adj_close" in session_rows.columns:
-        close_col = "adj_close"
-    if close_col is None:
-        st.error("Uploaded OHLCV file needs a 'close' or 'adj_close' column for returns.")
-        st.stop()
-    df_view["last_price"] = df_view["base_ticker"].map(session_rows[close_col])
+    session_rows_entry_all = ohlcv_upload_df[ohlcv_upload_df["date"] == entry_date]
+    st.caption(f"📐 Uploaded OHLCV rows for entry {entry_date}: {session_rows_entry_all.shape}")
+    if session_rows_entry_all.empty:
+        st.warning("Uploaded OHLCV file has no rows for the entry session date.")
+    session_rows_all = session_rows_entry_all
+    session_rows_entry = session_rows_entry_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
+    df_view["open_today"] = df_view["base_ticker"].map(
+        session_rows_entry["open"] if "open" in session_rows_entry.columns else pd.Series(dtype=float)
+    )
+
+    if effective_horizon == "next_open_to_open" and exit_date != entry_date:
+        session_rows_exit_all = ohlcv_upload_df[ohlcv_upload_df["date"] == exit_date]
+        st.caption(f"📐 Uploaded OHLCV rows for exit {exit_date}: {session_rows_exit_all.shape}")
+        session_rows_exit = session_rows_exit_all.drop_duplicates(subset=["ticker"]).set_index("ticker")
+        df_view["last_price"] = df_view["base_ticker"].map(
+            session_rows_exit["open"] if "open" in session_rows_exit.columns else pd.Series(dtype=float)
+        )
+    else:
+        close_col = "close" if "close" in session_rows_entry.columns else None
+        if close_col is None and "adj_close" in session_rows_entry.columns:
+            close_col = "adj_close"
+        if close_col is None:
+            st.error("Uploaded OHLCV file needs a 'close' or 'adj_close' column for returns.")
+            st.stop()
+        df_view["last_price"] = df_view["base_ticker"].map(session_rows_entry[close_col])
 
 else:  # future session
     st.info("Selected session is in the future. Returns will populate once data is available.")
@@ -712,6 +921,17 @@ def _fmt_delta(x):
     if pd.isna(x):
         return ""
     return f"{int(x):+d}"
+
+def _fmt_volume(x):
+    if pd.isna(x):
+        return ""
+    if abs(x) >= 1_000_000_000:
+        return f"{x / 1_000_000_000:.2f}B"
+    if abs(x) >= 1_000_000:
+        return f"{x / 1_000_000:.2f}M"
+    if abs(x) >= 1_000:
+        return f"{x / 1_000:.1f}K"
+    return f"{x:.0f}"
 
 def _fmt_pct_display(x: float) -> str:
     return "—" if pd.isna(x) else f"{x * 100:.2f}%"
@@ -886,14 +1106,23 @@ if price_mode == "live":
     open_label = "Open (today)"
     last_label = "Last price"
     return_label = "Return (open→now)"
-elif price_mode in {"historical_api", "upload"}:
-    open_label = "Open"
-    last_label = "Close"
-    return_label = "Return (open→close)"
 else:
-    open_label = "Open"
-    last_label = "Last price"
-    return_label = "Return"
+    if effective_horizon == "same_session":
+        open_label = "Open"
+        last_label = "Close"
+        return_label = "Return (open→close)"
+    elif effective_horizon == "next_open_to_close":
+        open_label = "Next open"
+        last_label = "Next close"
+        return_label = "Return (next open→next close)"
+    elif effective_horizon == "next_open_to_open":
+        open_label = "Next open"
+        last_label = "Following open"
+        return_label = "Return (next open→following open)"
+    else:
+        open_label = "Open"
+        last_label = "Last price"
+        return_label = "Return"
 
 show = show.rename(columns={
     "rank": "Rank",
@@ -1236,6 +1465,7 @@ if not baseline_ranked.empty:
 price_mode_label_map = {
     "live": "HTTP + rotating WS" if ws_enabled else "HTTP (delayed only)",
     "historical_api": "Historical daily bars (EODHD API)",
+    "sharadar": "Sharadar daily CSV",
     "upload": "Uploaded OHLCV file",
     "future": "Future session (awaiting data)",
 }
@@ -1252,6 +1482,9 @@ if price_mode == "live":
 elif price_mode == "historical_api":
     hist_shape = hist.shape if isinstance(hist, pd.DataFrame) else (0, 0)
     price_dim_lines.append(f"historical_bars: {hist_shape}")
+elif price_mode == "sharadar":
+    sharadar_shape = sharadar_df.shape if isinstance(sharadar_df, pd.DataFrame) else (0, 0)
+    price_dim_lines.append(f"sharadar_rows: {sharadar_shape}")
 elif price_mode == "upload":
     upload_shape = session_rows_all.shape if isinstance(session_rows_all, pd.DataFrame) else (0, 0)
     price_dim_lines.append(f"uploaded_rows: {upload_shape}")
@@ -1268,8 +1501,23 @@ st.caption(
     f"(chunk ≤{DEFAULT_WS_WINDOW}). This keeps HTTP API calls low while still refreshing a large watchlist."
 )
 
-if price_mode in {"historical_api", "upload"}:
-    st.caption("Historical mode: returns use session open → close (no WebSocket refresh required).")
+horizon_readable = horizon_options.get(effective_horizon, effective_horizon)
+trade_caption = (
+    f"Prediction date: **{prediction_date}**, trade session: **{session_date}** ({horizon_readable})."
+)
+if effective_horizon == "next_open_to_open" and exit_date != entry_date:
+    trade_caption += f" Exit session: **{exit_date}**."
+st.caption(trade_caption)
+
+if price_mode in {"historical_api", "upload", "sharadar"}:
+    horizon_copy = {
+        "same_session": "same-session open → close",
+        "next_open_to_close": "next-session open → close",
+        "next_open_to_open": "next-session open → following open",
+    }
+    st.caption(
+        f"Historical mode: returns use {horizon_copy.get(effective_horizon, 'the selected horizon')} (no WebSocket refresh required)."
+    )
 elif price_mode == "future":
     st.caption("Future session selected — waiting for market data to arrive.")
 
@@ -1597,6 +1845,60 @@ if not baseline_ranked.empty:
                 st.dataframe(baseline_shift_down, use_container_width=True, height=230)
             else:
                 st.info("No overlapping symbols yet.")
+
+history_source = None
+if price_mode == "sharadar" and isinstance(sharadar_df, pd.DataFrame):
+    history_source = sharadar_df.copy()
+elif price_mode == "upload" and isinstance(ohlcv_upload_df, pd.DataFrame):
+    history_source = ohlcv_upload_df.copy()
+
+financial_history_tbl = pd.DataFrame()
+if history_source is not None and not history_source.empty:
+    tickers_scope = df_view["base_ticker"].dropna().unique().tolist()
+    history_scope = history_source[history_source["ticker"].isin(tickers_scope)].copy()
+    if not history_scope.empty and "date" in history_scope.columns:
+        history_scope["date"] = pd.to_datetime(history_scope["date"]).dt.date
+        past_scope = history_scope[history_scope["date"] <= entry_date]
+        unique_dates = sorted(past_scope["date"].unique())
+        lookback = unique_dates[-5:] if len(unique_dates) > 5 else unique_dates
+        rows = []
+        for dt in lookback:
+            day = past_scope[past_scope["date"] == dt]
+            if day.empty:
+                continue
+            open_mean = day["open"].mean() if "open" in day.columns else np.nan
+            close_col = "close" if "close" in day.columns else ("adj_close" if "adj_close" in day.columns else None)
+            close_mean = day[close_col].mean() if close_col else np.nan
+            volume_mean = day["volume"].mean() if "volume" in day.columns else np.nan
+            if close_col and "open" in day.columns:
+                returns = day[close_col] / day["open"] - 1.0
+                returns = returns.replace([np.inf, -np.inf], np.nan)
+                avg_ret = returns.mean()
+            else:
+                avg_ret = np.nan
+            rows.append({
+                "date": dt,
+                "avg_open": float(open_mean) if pd.notna(open_mean) else np.nan,
+                "avg_close": float(close_mean) if pd.notna(close_mean) else np.nan,
+                "avg_volume": float(volume_mean) if pd.notna(volume_mean) else np.nan,
+                "avg_open_close_return": float(avg_ret) if pd.notna(avg_ret) else np.nan,
+            })
+        financial_history_tbl = pd.DataFrame(rows)
+
+if not financial_history_tbl.empty:
+    st.write("---")
+    with st.expander("📊 Recent daily metrics (Sharadar / uploaded data)", expanded=False):
+        st.caption(
+            "Five most recent sessions for the tickers in view, based on the loaded daily dataset."
+        )
+        history_display = financial_history_tbl.sort_values("date", ascending=False).copy()
+        history_display["Date"] = history_display["date"].apply(lambda d: d.strftime("%Y-%m-%d"))
+        history_display["Avg open"] = history_display["avg_open"].apply(_fmt_price)
+        history_display["Avg close"] = history_display["avg_close"].apply(_fmt_price)
+        history_display["Avg volume"] = history_display["avg_volume"].apply(_fmt_volume)
+        history_display["Avg open→close"] = history_display["avg_open_close_return"].apply(_fmt_pct)
+        cols_order = ["Date", "Avg open", "Avg close", "Avg open→close", "Avg volume"]
+        st.dataframe(history_display[cols_order], use_container_width=True, height=220)
 
 # Download
 csv_buf = io.StringIO()

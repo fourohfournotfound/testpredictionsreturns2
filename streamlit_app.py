@@ -611,6 +611,8 @@ else:
     else:
         preds = pd.DataFrame(columns=["ticker", "prediction"])
 
+preds_full_history = preds.copy()
+
 if preds.empty:
     st.info("Upload or point to your predictions CSV to get started. Expect columns like: `ticker`, `prediction`, optional `date`, optional `as_of`.")
     st.stop()
@@ -1458,6 +1460,147 @@ if not baseline_ranked.empty:
     baseline_shift_down = _format_shift(baseline_shift_down)
 
 
+def _compute_recent_prediction_summaries(
+    preds_all: pd.DataFrame,
+    prices_daily: Optional[pd.DataFrame],
+    horizon: str,
+    *,
+    max_days: int = 5,
+    k_values: Tuple[int, ...] = (1, 2, 3),
+    today_cutoff: Optional[date] = None,
+) -> pd.DataFrame:
+    """Summarize recent prediction sessions with compact long/short metrics."""
+
+    if (
+        preds_all is None
+        or preds_all.empty
+        or "date" not in preds_all.columns
+        or prices_daily is None
+        or prices_daily.empty
+        or "open" not in prices_daily.columns
+    ):
+        return pd.DataFrame()
+
+    preds_hist = preds_all.dropna(subset=["date", "prediction", "ticker"]).copy()
+    if preds_hist.empty:
+        return pd.DataFrame()
+
+    preds_hist["date"] = pd.to_datetime(preds_hist["date"]).dt.date
+    preds_hist["ticker"] = preds_hist["ticker"].astype(str).str.upper().str.strip()
+
+    price_hist = prices_daily.copy()
+    price_hist["date"] = pd.to_datetime(price_hist["date"]).dt.date
+    price_hist["ticker"] = price_hist["ticker"].astype(str).str.upper().str.strip()
+
+    unique_dates = sorted(preds_hist["date"].dropna().unique(), reverse=True)
+    rows = []
+
+    for pred_date in unique_dates:
+        entry_date = pred_date if horizon == "same_session" else _next_weekday(pred_date)
+        exit_date = entry_date
+        if horizon == "next_open_to_open":
+            exit_date = _next_weekday(entry_date)
+
+        if today_cutoff is not None and (
+            entry_date > today_cutoff or exit_date > today_cutoff
+        ):
+            continue
+
+        entry_prices_df = price_hist[price_hist["date"] == entry_date]
+        if entry_prices_df.empty:
+            continue
+
+        entry_open = entry_prices_df.dropna(subset=["open"]).set_index("ticker")["open"]
+        if entry_open.empty:
+            continue
+
+        if horizon == "next_open_to_open":
+            exit_prices_df = price_hist[price_hist["date"] == exit_date]
+            if exit_prices_df.empty or "open" not in exit_prices_df.columns:
+                continue
+            exit_series = exit_prices_df.dropna(subset=["open"]).set_index("ticker")["open"]
+        else:
+            if exit_date == entry_date:
+                exit_prices_df = entry_prices_df
+            else:
+                exit_prices_df = price_hist[price_hist["date"] == exit_date]
+            if exit_prices_df.empty:
+                continue
+            close_col = "close" if "close" in exit_prices_df.columns else None
+            if close_col is None and "adj_close" in exit_prices_df.columns:
+                close_col = "adj_close"
+            if close_col is None:
+                continue
+            exit_series = exit_prices_df.dropna(subset=[close_col]).set_index("ticker")[close_col]
+
+        combined = (
+            pd.DataFrame({"open": entry_open})
+            .join(exit_series.rename("exit"), how="inner")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if combined.empty:
+            continue
+
+        combined["return"] = combined["exit"] / combined["open"] - 1.0
+
+        preds_day = preds_hist[preds_hist["date"] == pred_date].copy()
+        preds_day = preds_day.merge(
+            combined[["return"]], left_on="ticker", right_index=True, how="left"
+        )
+        if preds_day.empty:
+            continue
+
+        preds_day = preds_day.sort_values("prediction", ascending=False).reset_index(drop=True)
+        preds_day["rank"] = np.arange(1, len(preds_day) + 1)
+
+        realized = preds_day[preds_day["return"].notna()].copy()
+        if realized.empty:
+            continue
+
+        row = {
+            "prediction_date": pred_date,
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "realized_count": int(realized.shape[0]),
+            "rank_ic": _spearman_corr(preds_day["prediction"], preds_day["return"]),
+        }
+
+        bottom_sorted = preds_day.sort_values("prediction", ascending=True).reset_index(drop=True)
+
+        for k in k_values:
+            top_slice = preds_day.head(int(k))
+            top_slice = top_slice[top_slice["return"].notna()]
+            long_mean = float(top_slice["return"].mean()) if not top_slice.empty else np.nan
+
+            bottom_slice = bottom_sorted.head(int(k))
+            bottom_slice = bottom_slice[bottom_slice["return"].notna()]
+            short_mean = float(bottom_slice["return"].mean()) if not bottom_slice.empty else np.nan
+
+            short_pnl = float(-short_mean) if pd.notna(short_mean) else np.nan
+            long_short = (
+                float(long_mean - short_mean)
+                if pd.notna(long_mean) and pd.notna(short_mean)
+                else np.nan
+            )
+
+            row[f"top{k}_long"] = long_mean
+            row[f"top{k}_short"] = short_pnl
+            row[f"top{k}_ls"] = long_short
+
+        rows.append(row)
+
+        if len(rows) >= max_days:
+            break
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values("entry_date", ascending=False).reset_index(drop=True)
+    return out
+
+
 # -----------------------
 # UI
 # -----------------------
@@ -1885,20 +2028,75 @@ if history_source is not None and not history_source.empty:
             })
         financial_history_tbl = pd.DataFrame(rows)
 
-if not financial_history_tbl.empty:
+recent_prediction_metrics = _compute_recent_prediction_summaries(
+    preds_full_history,
+    history_source,
+    effective_horizon,
+    max_days=5,
+    today_cutoff=today_ny,
+)
+
+if not financial_history_tbl.empty or not recent_prediction_metrics.empty:
     st.write("---")
     with st.expander("📊 Recent daily metrics (Sharadar / uploaded data)", expanded=False):
         st.caption(
-            "Five most recent sessions for the tickers in view, based on the loaded daily dataset."
+            "Five most recent sessions for the tickers in view, plus realized performance for recent prediction dates."
         )
-        history_display = financial_history_tbl.sort_values("date", ascending=False).copy()
-        history_display["Date"] = history_display["date"].apply(lambda d: d.strftime("%Y-%m-%d"))
-        history_display["Avg open"] = history_display["avg_open"].apply(_fmt_price)
-        history_display["Avg close"] = history_display["avg_close"].apply(_fmt_price)
-        history_display["Avg volume"] = history_display["avg_volume"].apply(_fmt_volume)
-        history_display["Avg open→close"] = history_display["avg_open_close_return"].apply(_fmt_pct)
-        cols_order = ["Date", "Avg open", "Avg close", "Avg open→close", "Avg volume"]
-        st.dataframe(history_display[cols_order], use_container_width=True, height=220)
+        if not financial_history_tbl.empty:
+            history_display = financial_history_tbl.sort_values("date", ascending=False).copy()
+            history_display["Date"] = history_display["date"].apply(lambda d: d.strftime("%Y-%m-%d"))
+            history_display["Avg open"] = history_display["avg_open"].apply(_fmt_price)
+            history_display["Avg close"] = history_display["avg_close"].apply(_fmt_price)
+            history_display["Avg volume"] = history_display["avg_volume"].apply(_fmt_volume)
+            history_display["Avg open→close"] = history_display["avg_open_close_return"].apply(_fmt_pct)
+            cols_order = ["Date", "Avg open", "Avg close", "Avg open→close", "Avg volume"]
+            st.markdown("**Price overview**")
+            st.dataframe(history_display[cols_order], use_container_width=True, height=220)
+        else:
+            st.info("Price overview unavailable (no Sharadar/uploaded daily history for recent sessions).")
+
+        if not recent_prediction_metrics.empty:
+            recent_display = recent_prediction_metrics.copy()
+            recent_display["Prediction"] = recent_display["prediction_date"].apply(
+                lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+            )
+            recent_display["Session"] = recent_display["entry_date"].apply(
+                lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+            )
+            recent_display["Exit"] = recent_display["exit_date"].apply(
+                lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+            )
+            recent_display["Realized #"] = recent_display["realized_count"].apply(lambda x: f"{int(x):,}")
+            recent_display["Rank IC (Spearman)"] = recent_display["rank_ic"].apply(
+                lambda x: "—" if pd.isna(x) else f"{x:.3f}"
+            )
+            for k in (1, 2, 3):
+                recent_display[f"Top{k} long"] = recent_display[f"top{k}_long"].apply(_fmt_pct_display)
+                recent_display[f"Top{k} short"] = recent_display[f"top{k}_short"].apply(_fmt_pct_display)
+                recent_display[f"Top{k} L-S"] = recent_display[f"top{k}_ls"].apply(_fmt_pct_display)
+
+            cols = [
+                "Prediction",
+                "Session",
+                "Exit",
+                "Realized #",
+                "Rank IC (Spearman)",
+                "Top1 long",
+                "Top1 short",
+                "Top1 L-S",
+                "Top2 long",
+                "Top2 short",
+                "Top2 L-S",
+                "Top3 long",
+                "Top3 short",
+                "Top3 L-S",
+            ]
+            st.markdown("**Prediction performance detail**")
+            st.dataframe(recent_display[cols], use_container_width=True, height=260)
+        else:
+            st.info(
+                "Prediction performance detail unavailable. Provide a daily OHLCV history that covers recent prediction dates."
+            )
 
 # Download
 csv_buf = io.StringIO()

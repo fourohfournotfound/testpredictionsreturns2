@@ -1461,11 +1461,11 @@ if not baseline_ranked.empty:
 
 
 def _compute_recent_prediction_summaries(
-    preds_all: pd.DataFrame,
+    preds_all: Optional[pd.DataFrame],
     prices_daily: Optional[pd.DataFrame],
     horizon: str,
     *,
-    max_days: int = 5,
+    max_days: Optional[int] = 5,
     k_values: Tuple[int, ...] = (1, 2, 3),
     today_cutoff: Optional[date] = None,
 ) -> pd.DataFrame:
@@ -1590,7 +1590,7 @@ def _compute_recent_prediction_summaries(
 
         rows.append(row)
 
-        if len(rows) >= max_days:
+        if max_days is not None and len(rows) >= max_days:
             break
 
     if not rows:
@@ -2028,19 +2028,19 @@ if history_source is not None and not history_source.empty:
             })
         financial_history_tbl = pd.DataFrame(rows)
 
-recent_prediction_metrics = _compute_recent_prediction_summaries(
+recent_prediction_metrics_full = _compute_recent_prediction_summaries(
     preds_full_history,
     history_source,
     effective_horizon,
-    max_days=5,
+    max_days=None,
     today_cutoff=today_ny,
 )
 
-if not financial_history_tbl.empty or not recent_prediction_metrics.empty:
+if not financial_history_tbl.empty or not recent_prediction_metrics_full.empty:
     st.write("---")
     with st.expander("📊 Recent daily metrics (Sharadar / uploaded data)", expanded=False):
         st.caption(
-            "Five most recent sessions for the tickers in view, plus realized performance for recent prediction dates."
+            "Recent sessions for the tickers in view, plus realized performance for available prediction dates."
         )
         if not financial_history_tbl.empty:
             history_display = financial_history_tbl.sort_values("date", ascending=False).copy()
@@ -2055,8 +2055,38 @@ if not financial_history_tbl.empty or not recent_prediction_metrics.empty:
         else:
             st.info("Price overview unavailable (no Sharadar/uploaded daily history for recent sessions).")
 
-        if not recent_prediction_metrics.empty:
-            recent_display = recent_prediction_metrics.copy()
+        if not recent_prediction_metrics_full.empty:
+            sessions_to_show = len(recent_prediction_metrics_full)
+            controls_col, _ = st.columns([3, 2])
+            with controls_col:
+                show_all_recent = st.checkbox(
+                    "Show all prediction sessions",
+                    value=False,
+                    key="recent_metrics_show_all",
+                    help="When checked, include every realized prediction session in the table below.",
+                )
+
+                if not show_all_recent:
+                    max_sessions_available = int(len(recent_prediction_metrics_full))
+                    default_sessions = min(30, max_sessions_available) if max_sessions_available else 0
+                    if max_sessions_available:
+                        sessions_to_show = st.slider(
+                            "Recent prediction sessions to include",
+                            min_value=1,
+                            max_value=max_sessions_available,
+                            value=default_sessions if default_sessions else max_sessions_available,
+                            step=1,
+                            key="recent_metrics_window",
+                            help="Controls how many of the most recent realized sessions are summarized.",
+                        )
+                    else:
+                        sessions_to_show = 0
+
+            if sessions_to_show:
+                recent_display = recent_prediction_metrics_full.head(int(sessions_to_show)).copy()
+            else:
+                recent_display = recent_prediction_metrics_full.copy()
+
             recent_display["Prediction"] = recent_display["prediction_date"].apply(
                 lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
             )
@@ -2093,6 +2123,36 @@ if not financial_history_tbl.empty or not recent_prediction_metrics.empty:
             ]
             st.markdown("**Prediction performance detail**")
             st.dataframe(recent_display[cols], use_container_width=True, height=260)
+
+            # 30-day average of Top3 metrics
+            avg_cutoff = today_ny - timedelta(days=30)
+            if "entry_date" in recent_prediction_metrics_full.columns:
+                avg_scope = recent_prediction_metrics_full[
+                    recent_prediction_metrics_full["entry_date"].apply(
+                        lambda d: isinstance(d, date) and d >= avg_cutoff
+                    )
+                ]
+            else:
+                avg_scope = pd.DataFrame()
+
+            if not avg_scope.empty:
+                avg_long = float(avg_scope["top3_long"].mean()) if "top3_long" in avg_scope else np.nan
+                avg_short = float(avg_scope["top3_short"].mean()) if "top3_short" in avg_scope else np.nan
+                avg_ls = float(avg_scope["top3_ls"].mean()) if "top3_ls" in avg_scope else np.nan
+
+                avg_summary = pd.DataFrame(
+                    {
+                        "Focus": ["Top3 long", "Top3 short", "Top3 L-S"],
+                        "30-day average": [avg_long, avg_short, avg_ls],
+                    }
+                )
+                avg_summary["30-day average"] = avg_summary["30-day average"].apply(_fmt_pct_display)
+                st.markdown("**Top3 30-day averages**")
+                st.dataframe(avg_summary, use_container_width=True, height=160)
+            else:
+                st.info(
+                    "30-day averages unavailable — provide realized sessions within the last 30 days to see this summary."
+                )
         else:
             st.info(
                 "Prediction performance detail unavailable. Provide a daily OHLCV history that covers recent prediction dates."

@@ -842,9 +842,9 @@ if price_mode == "live" and (now_et >= session_close or st.session_state.get("__
         df_view["return_open_to_now"] = (df_view["last_price"] / df_view["open_today"] - 1.0).replace([np.inf, -np.inf], np.nan)
         st.caption("✅ After‑close: using **official EOD open→close** for today's final returns (EODHD historical API).")
     else:
-        st.caption("ℹ️ After‑close: EOD data not yet published per EODHD schedule (~2–3h after close for US). Using lastTradePrice as provisional close.")[  # US EOD delay
-            0
-        ]  # lint silence
+        st.caption(
+            "ℹ️ After‑close: EOD data not yet published per EODHD schedule (~2–3h after close for US). Using lastTradePrice as provisional close."
+        )
 
 # Optionally drop NA rows
 if not allow_na_returns:

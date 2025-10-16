@@ -595,7 +595,7 @@ def _should_http_refresh() -> bool:
     last = st.session_state.get("last_http_refresh_at")
     if last is None:
         return True
-    return (datetime.now(tz=NY) - last) >= timedelta(minutes=int(http_mins))
+    return (datetime.now(tz=NY) - last) >= timedelta(minutes=int(http_refresh_mins))
 
 def _mark_http_refreshed():
     st.session_state["last_http_refresh_at"] = datetime.now(tz=NY)

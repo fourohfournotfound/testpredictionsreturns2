@@ -255,27 +255,6 @@ with st.sidebar:
         help="Live v2 costs 1 API call per ticker (batched). Keep 0 to avoid burning calls."
     )
 
-    last_refresh_at = st.session_state.get("last_http_refresh_at")
-    if isinstance(last_refresh_at, datetime):
-        st.caption(
-            "Last Live v2 refresh: "
-            + last_refresh_at.astimezone(NY).strftime("%Y-%m-%d %H:%M:%S %Z")
-        )
-
-    if st.button(
-        "🔄 Force Live HTTP refresh now",
-        help=(
-            "Clear the cached Live v2 snapshot immediately. Useful after hours when WebSockets "
-            "go quiet but you still want the closing price."
-        ),
-        use_container_width=True,
-    ):
-        st.session_state["force_http_refresh"] = True
-        st.session_state["force_http_refresh_triggered"] = True
-
-    if st.session_state.pop("force_http_refresh_triggered", False):
-        st.success("Refreshing Live v2 snapshot…")
-
     # --- NEW: robust evaluation controls (metrics only; no API calls) ---
     st.write("**Evaluation metrics (robust)**")
     metrics_topk = st.slider(
@@ -342,20 +321,13 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
         st.error("Missing required column(s): " + ", ".join(missing))
         st.stop()
 
-    out = df.rename(columns={ticker_col: "ticker", pred_col: "prediction"}).copy()
+    out = df.rename(columns={ticker_col: "ticker", pred_col: "prediction"})
     if date_col: out = out.rename(columns={date_col: "date"})
     if asof_col: out = out.rename(columns={asof_col: "as_of"})
 
     out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
     if "date" in out.columns:
         out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.date
-    else:
-        assumed_date = datetime.now(tz=NY).date()
-        out["date"] = assumed_date
-        st.caption(
-            "🕒 No `date` column found in predictions; assuming current NY session "
-            f"({assumed_date})."
-        )
 
     if "as_of" in out.columns:
         def _parse_asof(x):
@@ -570,10 +542,6 @@ def _should_http_refresh() -> bool:
 
 def _mark_http_refreshed():
     st.session_state["last_http_refresh_at"] = datetime.now(tz=NY)
-
-def _consume_manual_http_refresh() -> bool:
-    """Return True once when the manual refresh button is used."""
-    return bool(st.session_state.pop("force_http_refresh", False))
 
 # -----------------------
 # Rotating WS updater (no SDK)
@@ -827,8 +795,7 @@ session_rows = None
 
 if price_mode == "live":
     quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)  # index: EOD symbol
-    manual_http_refresh = _consume_manual_http_refresh()
-    if manual_http_refresh or _should_http_refresh():
+    if _should_http_refresh():
         _livev2_quotes_once.clear()
         quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)
         _mark_http_refreshed()
@@ -970,10 +937,6 @@ def _fmt_volume(x):
 
 def _fmt_pct_display(x: float) -> str:
     return "—" if pd.isna(x) else f"{x * 100:.2f}%"
-
-
-def _fmt_corr_display(x: float) -> str:
-    return "—" if pd.isna(x) else f"{x:.3f}"
 
 def _fmt_delta_points(x: float) -> str:
     return "" if pd.isna(x) else f"{x * 100:.1f} pts"
@@ -2116,7 +2079,6 @@ if not financial_history_tbl.empty or not recent_prediction_metrics_full.empty:
                             key="recent_metrics_window",
                             help="Controls how many of the most recent realized sessions are summarized.",
                         )
-                        st.caption("Slide to include more sessions (up to the full history).")
                     else:
                         sessions_to_show = 0
 
@@ -2160,13 +2122,7 @@ if not financial_history_tbl.empty or not recent_prediction_metrics_full.empty:
                 "Top3 L-S",
             ]
             st.markdown("**Prediction performance detail**")
-            table_rows = max(1, len(recent_display))
-            table_height = min(800, 80 + 28 * table_rows)
-            st.dataframe(
-                recent_display[cols],
-                use_container_width=True,
-                height=table_height,
-            )
+            st.dataframe(recent_display[cols], use_container_width=True, height=260)
 
             # 30-day average of Top3 metrics
             avg_cutoff = today_ny - timedelta(days=30)
@@ -2183,24 +2139,16 @@ if not financial_history_tbl.empty or not recent_prediction_metrics_full.empty:
                 avg_long = float(avg_scope["top3_long"].mean()) if "top3_long" in avg_scope else np.nan
                 avg_short = float(avg_scope["top3_short"].mean()) if "top3_short" in avg_scope else np.nan
                 avg_ls = float(avg_scope["top3_ls"].mean()) if "top3_ls" in avg_scope else np.nan
-                avg_rank_ic = float(avg_scope["rank_ic"].mean()) if "rank_ic" in avg_scope else np.nan
-
-                avg_rows = [
-                    ("Top3 long", avg_long, _fmt_pct_display),
-                    ("Top3 short", avg_short, _fmt_pct_display),
-                    ("Top3 L-S", avg_ls, _fmt_pct_display),
-                ]
-                avg_rows.append(("Rank IC (Spearman)", avg_rank_ic, _fmt_corr_display))
 
                 avg_summary = pd.DataFrame(
                     {
-                        "Focus": [label for label, _, _ in avg_rows],
-                        "30-day average": [fmt(value) for _, value, fmt in avg_rows],
+                        "Focus": ["Top3 long", "Top3 short", "Top3 L-S"],
+                        "30-day average": [avg_long, avg_short, avg_ls],
                     }
                 )
-                st.markdown("**Top3 & IC 30-day averages**")
-                summary_height = min(320, 60 + 32 * len(avg_summary))
-                st.dataframe(avg_summary, use_container_width=True, height=summary_height)
+                avg_summary["30-day average"] = avg_summary["30-day average"].apply(_fmt_pct_display)
+                st.markdown("**Top3 30-day averages**")
+                st.dataframe(avg_summary, use_container_width=True, height=160)
             else:
                 st.info(
                     "30-day averages unavailable — provide realized sessions within the last 30 days to see this summary."

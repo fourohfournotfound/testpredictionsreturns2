@@ -742,7 +742,7 @@ if price_mode == "upload":
 # Price data assembly (live vs historical vs upload)
 # -----------------------
 map_df = pd.DataFrame({"ticker": symbols_in, "eod_symbol": symbols_eod}).drop_duplicates()
-map_df["base_ticker"] = map_df["ticker"].str.upper().str.strip()
+map_df["base_ticker"] = map_df["ticker"].astype(str).str.upper().str.strip()
 df_view = preds_ranked.merge(map_df, on="ticker", how="left")
 
 if not baseline_ranked.empty:

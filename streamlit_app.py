@@ -409,10 +409,27 @@ def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFra
 def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guard: bool) -> pd.DataFrame:
     out = df.copy()
     if require_asof_guard and "as_of" in out.columns:
-        mask_ok = df["as_of"].isna() | (df["as_of"] <= session_open)
+        mask_ok = out["as_of"].isna() | (out["as_of"] <= session_open)
+
+        # Some files use T+1 dating (date = prior session) but stamp `as_of` with
+        # the trade session (or later) which would normally trigger the guard.
+        # If we can confirm the row is explicitly tagged for a prior session via
+        # a `date` column, allow it to pass while keeping strict blocking for
+        # same-session look-ahead.
+        restored = 0
+        if "date" in out.columns:
+            pred_dates = pd.to_datetime(out["date"], errors="coerce").dt.date
+            fallback_mask = (~mask_ok) & pred_dates.notna() & (pred_dates < session_open.date())
+            if fallback_mask.any():
+                mask_ok = mask_ok | fallback_mask
+                restored = int(fallback_mask.sum())
+
         before = out.shape
         out = out[mask_ok]
-        st.caption(f"📐 After enforcing as_of ≤ session_open (no look-ahead): {before} → {out.shape}")
+        msg = f"📐 After enforcing as_of ≤ session_open (no look-ahead): {before} → {out.shape}"
+        if restored:
+            msg += f" (restored {restored} via prior-session date alignment)"
+        st.caption(msg)
     return out
 
 # -----------------------

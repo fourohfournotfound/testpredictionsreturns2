@@ -46,6 +46,7 @@ import pytz
 from dateutil import parser as dateparser
 import requests
 import altair as alt
+from pandas.tseries.offsets import BDay
 
 try:
     import websocket  # websocket-client
@@ -380,8 +381,29 @@ def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFra
     out = df.copy()
     if "date" in out.columns:
         before = out.shape
-        out = out[out["date"] == session]
-        st.caption(f"📐 After filtering to session={session} (by 'date'): {before} → {out.shape}")
+        prediction_dates = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None)
+        tplus1_sessions = (prediction_dates + BDay()).dt.date
+        mask_tplus1 = tplus1_sessions == session
+        if mask_tplus1.any():
+            out = out.loc[mask_tplus1]
+            source_dates = prediction_dates.loc[mask_tplus1].dt.date.unique()
+            stamped = ", ".join(sorted({d.isoformat() for d in source_dates if pd.notna(d)})) or "unknown"
+            st.caption(
+                "📐 After aligning T+1 predictions (date + next trading day) "
+                f"for session={session}: {before} → {out.shape} | source stamp(s): {stamped}"
+            )
+        else:
+            mask_exact = prediction_dates.dt.date == session
+            if mask_exact.any():
+                out = out.loc[mask_exact]
+                st.caption(
+                    f"📐 After filtering to session={session} using direct date match: {before} → {out.shape}"
+                )
+            else:
+                out = out.iloc[0:0]
+                st.caption(
+                    f"📐 After aligning for session={session}: {before} → {out.shape} (no matching dates found)"
+                )
     return out
 
 def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guard: bool) -> pd.DataFrame:

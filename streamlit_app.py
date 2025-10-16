@@ -256,6 +256,49 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     date_col   = next((cols[k] for k in cols if k in ["date", "session_date", "target_date"]), None)
     asof_col   = next((cols[k] for k in cols if k in ["as_of", "asof", "timestamp", "prediction_time"]), None)
 
+    # Wide format handler: when columns are [date, <tickers...>] with no explicit ticker/pred columns
+    if ticker_col is None and pred_col is None and date_col is not None:
+        df = df.copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col])
+        if df.empty:
+            st.error("Prediction file has no valid dates to select from.")
+            st.stop()
+
+        df[date_col] = df[date_col].dt.tz_localize(None).dt.date
+        df = df.sort_values(date_col)
+        latest_row = df.tail(1)
+        latest_date = latest_row[date_col].iloc[0]
+
+        meta_cols = {date_col}
+        if asof_col:
+            meta_cols.add(asof_col)
+        meta_lower = {"as_of", "asof", "timestamp", "prediction_time"}
+        value_cols = [
+            c
+            for c in latest_row.columns
+            if c not in meta_cols and c.lower().strip() not in meta_lower
+        ]
+        if not value_cols:
+            st.error("Prediction file appears wide-format but no ticker columns were found.")
+            st.stop()
+
+        latest_values = latest_row[value_cols].T
+        latest_values.columns = ["prediction"]
+        latest_values = latest_values.reset_index().rename(columns={"index": "ticker"})
+        latest_values["date"] = latest_date
+
+        st.caption(
+            f"📐 Detected wide predictions format; using latest date {latest_date} with {len(value_cols)} tickers."
+        )
+
+        df = latest_values
+        cols = {c.lower().strip(): c for c in df.columns}
+        ticker_col = next((cols[k] for k in cols if k in ["ticker", "symbol"]), None)
+        pred_col   = next((cols[k] for k in cols if k in ["prediction", "pred", "pred_score", "score", "yhat"]), None)
+        date_col   = next((cols[k] for k in cols if k in ["date", "session_date", "target_date"]), None)
+        asof_col   = next((cols[k] for k in cols if k in ["as_of", "asof", "timestamp", "prediction_time"]), None)
+
     missing = []
     if ticker_col is None: missing.append("ticker")
     if pred_col is None:   missing.append("prediction")
@@ -268,6 +311,7 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     if asof_col: out = out.rename(columns={asof_col: "as_of"})
 
     out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
+    out["prediction"] = pd.to_numeric(out["prediction"], errors="coerce")
     if "date" in out.columns:
         out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.date
 

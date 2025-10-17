@@ -209,6 +209,27 @@ with st.sidebar:
         help="Live v2 costs 1 API call per ticker (batched). Keep 0 to avoid burning calls."
     )
 
+    last_refresh_at = st.session_state.get("last_http_refresh_at")
+    if isinstance(last_refresh_at, datetime):
+        st.caption(
+            "Last Live v2 refresh: "
+            + last_refresh_at.astimezone(NY).strftime("%Y-%m-%d %H:%M:%S %Z")
+        )
+
+    if st.button(
+        "🔄 Force Live HTTP refresh now",
+        help=(
+            "Clear the cached Live v2 snapshot immediately. Useful after hours when WebSockets "
+            "go quiet but you still want the closing price."
+        ),
+        use_container_width=True,
+    ):
+        st.session_state["force_http_refresh"] = True
+        st.session_state["force_http_refresh_triggered"] = True
+
+    if st.session_state.pop("force_http_refresh_triggered", False):
+        st.success("Refreshing Live v2 snapshot…")
+
     # --- NEW: robust evaluation controls (metrics only; no API calls) ---
     st.write("**Evaluation metrics (robust)**")
     metrics_topk = st.slider(
@@ -545,6 +566,10 @@ def _should_http_refresh() -> bool:
 def _mark_http_refreshed():
     st.session_state["last_http_refresh_at"] = datetime.now(tz=NY)
 
+def _consume_manual_http_refresh() -> bool:
+    """Return True once when the manual refresh button is used."""
+    return bool(st.session_state.pop("force_http_refresh", False))
+
 # -----------------------
 # Rotating WS updater (no SDK)
 # -----------------------
@@ -716,7 +741,8 @@ session_rows = None
 
 if price_mode == "live":
     quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)  # index: EOD symbol
-    if _should_http_refresh():
+    manual_http_refresh = _consume_manual_http_refresh()
+    if manual_http_refresh or _should_http_refresh():
         _livev2_quotes_once.clear()
         quotes_snapshot = _livev2_quotes_once(symbols_eod_tuple)
         _mark_http_refreshed()

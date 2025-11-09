@@ -9,9 +9,12 @@
 # - Auto-refresh UI; HTTP snapshot refresh cadence is configurable (default = never, to save quota)
 #
 # Docs used:
-# - Live v2 (US extended quotes): endpoint /api/us-quote-delayed, s= batching, fields (open, lastTradePrice), 1 call / ticker, page[limit]≤100.  [EODHD "Live v2 for US Stocks: Extended Quotes (2025)"]
-# - WebSockets: wss://ws.eodhistoricaldata.com/ws/us?api_token=..., subscribe/unsubscribe JSON; ~50 symbols/connection by default; WS does NOT consume API calls.  [EODHD "Real-Time Data API via WebSockets"]
-# - API limits: daily calls counted per symbol, 100k/day default.  [EODHD "API Limits"]
+# - Live v2 (US extended quotes): endpoint /api/us-quote-delayed, supports batching via s=, page[limit]≤100,
+#   fields include 'open', 'lastTradePrice', 'lastTradeTime' and more. Costs ~1 API call / ticker.  [EODHD Live v2]
+# - WebSockets: wss://ws.eodhistoricaldata.com/ws/us?api_token=..., subscribe/unsubscribe JSON; default ~50
+#   symbols per connection; pre/post-market supported; WS does NOT consume API calls.  [EODHD WebSockets]
+# - EOD daily bars: /api/eod/{symbol}?from=YYYY-MM-DD&to=YYYY-MM-DD returns OHLC for the session.  [EODHD EOD API]
+# - Trading calendar: NYSE (pandas_market_calendars) .valid_days() / .schedule() used for T+1 alignment.  [PMC]
 # -----------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -48,6 +51,18 @@ import requests
 import altair as alt
 from pandas.tseries.offsets import BDay
 
+# --- NEW: robust trading calendar (NYSE) for T+1 alignment ---
+try:
+    import pandas_market_calendars as mcal  # optional; we fall back to BDay if unavailable
+    _HAS_PMC = True
+    try:
+        _NYSE_CAL = mcal.get_calendar("NYSE")
+    except Exception:
+        _NYSE_CAL = None
+except Exception:
+    _HAS_PMC = False
+    _NYSE_CAL = None
+
 try:
     import websocket  # websocket-client
     _HAS_WS = True
@@ -65,7 +80,7 @@ BASE_HOST = "https://eodhd.com"
 LIVE_V2_URL = f"{BASE_HOST}/api/us-quote-delayed"   # US extended quotes (delayed); includes 'open' and 'lastTradePrice'
 
 HTTP_BATCH = 100           # Live v2: page[limit] max 100
-DEFAULT_WS_WINDOW = 50     # per EODHD docs: ~50 concurrent symbols per connection by default
+DEFAULT_WS_WINDOW = 50     # EODHD docs: ~50 concurrent symbols per connection by default
 DEFAULT_WS_DWELL = 2       # seconds to sit on each WS rotation slice
 CACHE_TTL_LIVEV2 = 60 * 60 * 6   # 6h; 'open' is fixed after regular open, lastTradePrice is WS-overridden
 
@@ -209,7 +224,7 @@ with st.sidebar:
         help="Live v2 costs 1 API call per ticker (batched). Keep 0 to avoid burning calls."
     )
 
-    # --- NEW: robust evaluation controls (metrics only; no API calls) ---
+    # --- Robust evaluation controls (metrics only; no API calls) ---
     st.write("**Evaluation metrics (robust)**")
     metrics_topk = st.slider(
         "Top-K for metrics (used for medians & win rate)",
@@ -377,33 +392,76 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 def _load_ohlcv_from_upload(upload: io.BytesIO) -> pd.DataFrame:
     return _normalize_ohlcv(pd.read_csv(upload))
 
+# --- NEW: calendar-aware trading day shift helpers ---
+def _nyse_next_trading_day(d: date, n: int = 1) -> date:
+    """
+    Return the n-th NEXT **trading** day after date d using NYSE calendar.
+    If the calendar package is unavailable, fall back to pandas BDay (weekday business day).
+    """
+    if _NYSE_CAL is None:
+        return (pd.Timestamp(d) + BDay(n)).date()
+    # Build a modest window around d; schedule index are the *session dates*
+    start = (pd.Timestamp(d) - pd.Timedelta(days=7)).date()
+    end = (pd.Timestamp(d) + pd.Timedelta(days=45)).date()
+    sched = _NYSE_CAL.schedule(start_date=start, end_date=end)
+    days = sched.index  # DatetimeIndex of session dates (tz-naive, one per session)
+    # first session strictly AFTER d
+    pos = days.searchsorted(pd.Timestamp(d), side="right")
+    target = pos + (n - 1)
+    if target >= len(days):
+        target = len(days) - 1
+    return days[target].date()
+
+def _series_tplus1_trading(dates: pd.Series) -> pd.Series:
+    """Vectorized mapping: each input date -> next NYSE trading day."""
+    def _map_one(x):
+        if pd.isna(x):
+            return pd.NaT
+        return _nyse_next_trading_day(pd.Timestamp(x).date(), 1)
+    return pd.Series([_map_one(x) for x in dates], index=dates.index, dtype="object")
+
 def _align_and_filter_for_session(df: pd.DataFrame, session: date) -> pd.DataFrame:
+    """
+    Align predictions to the *target* trading session:
+      - Prefer the slice where (prediction_date + next trading day) == session (T+1 convention),
+        computed with the NYSE calendar (holidays respected).
+      - If no such rows, fall back to exact date == session.
+      - If both exist, choose the slice with **more rows** to avoid mixed-file pitfalls.
+    """
     out = df.copy()
     if "date" in out.columns:
         before = out.shape
-        prediction_dates = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None)
-        tplus1_sessions = (prediction_dates + BDay()).dt.date
-        mask_tplus1 = tplus1_sessions == session
-        if mask_tplus1.any():
-            out = out.loc[mask_tplus1]
-            source_dates = prediction_dates.loc[mask_tplus1].dt.date.unique()
-            stamped = ", ".join(sorted({d.isoformat() for d in source_dates if pd.notna(d)})) or "unknown"
+        pred_dates = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None).dt.date
+        tplus1_sessions = _series_tplus1_trading(pred_dates)
+        mask_tplus1 = (tplus1_sessions == session)
+        mask_exact = (pred_dates == session)
+
+        cnt_tplus1 = int(mask_tplus1.sum())
+        cnt_exact = int(mask_exact.sum())
+
+        if cnt_tplus1 == 0 and cnt_exact == 0:
+            out = out.iloc[0:0]
             st.caption(
-                "📐 After aligning T+1 predictions (date + next trading day) "
-                f"for session={session}: {before} → {out.shape} | source stamp(s): {stamped}"
+                f"📐 After aligning for session={session}: {before} → {out.shape} (no matching dates; check file stamps)"
+            )
+            return out
+
+        # Choose the slice with more rows; tie-breaker favors T+1 (most common convention for next-session trading)
+        use_tplus1 = (cnt_tplus1 >= cnt_exact) and (cnt_tplus1 > 0)
+        if use_tplus1:
+            out = out.loc[mask_tplus1]
+            src_dates = sorted({d.isoformat() for d in pred_dates.loc[mask_tplus1] if pd.notna(d)})
+            st.caption(
+                "📐 After aligning **T+1 (NYSE calendar)** for session="
+                f"{session}: {before} → {out.shape} | source stamp(s): {', '.join(src_dates) or 'unknown'}"
             )
         else:
-            mask_exact = prediction_dates.dt.date == session
-            if mask_exact.any():
-                out = out.loc[mask_exact]
-                st.caption(
-                    f"📐 After filtering to session={session} using direct date match: {before} → {out.shape}"
-                )
-            else:
-                out = out.iloc[0:0]
-                st.caption(
-                    f"📐 After aligning for session={session}: {before} → {out.shape} (no matching dates found)"
-                )
+            out = out.loc[mask_exact]
+            src_dates = sorted({d.isoformat() for d in pred_dates.loc[mask_exact] if pd.notna(d)})
+            st.caption(
+                f"📐 After filtering to session={session} via exact prediction 'date': {before} → {out.shape} "
+                f"| source stamp(s): {', '.join(src_dates) or 'unknown'}"
+            )
     return out
 
 def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guard: bool) -> pd.DataFrame:
@@ -411,11 +469,7 @@ def _post_asof_guard(df: pd.DataFrame, session_open: datetime, require_asof_guar
     if require_asof_guard and "as_of" in out.columns:
         mask_ok = out["as_of"].isna() | (out["as_of"] <= session_open)
 
-        # Some files use T+1 dating (date = prior session) but stamp `as_of` with
-        # the trade session (or later) which would normally trigger the guard.
-        # If we can confirm the row is explicitly tagged for a prior session via
-        # a `date` column, allow it to pass while keeping strict blocking for
-        # same-session look-ahead.
+        # Allow prior-session rows to pass if clearly tagged via 'date' < session date
         restored = 0
         if "date" in out.columns:
             pred_dates = pd.to_datetime(out["date"], errors="coerce").dt.date
@@ -497,7 +551,7 @@ def _livev2_quotes_once(symbols_eod: Tuple[str, ...]) -> pd.DataFrame:
     """
     Fetch delayed quotes for all requested symbols (one-time snapshot).
     Returns DataFrame indexed by symbol with at least columns: ['open', 'lastTradePrice'].
-    NOTE: Consumes 1 API call per symbol per EODHD docs. Keep TTL high to save quota.
+    NOTE: Consumes 1 API call per ticker per EODHD docs. Keep TTL high to save quota.
     """
     if not symbols_eod:
         return pd.DataFrame(columns=["symbol", "open", "lastTradePrice"]).set_index("symbol")
@@ -851,7 +905,6 @@ if not chart_data.empty:
         )
     chart_data.sort_values("rank", inplace=True)
 
-
 top_k_count = int(min(int(summary_topk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
 bottom_k_count = int(min(int(summary_bottomk), len(returns_ready_sorted))) if len(returns_ready_sorted) else 0
 
@@ -869,6 +922,7 @@ if not top_slice.empty and not bottom_slice.empty:
     long_short_spread = (long_leg_sum + short_leg_sum) / total_positions if total_positions else np.nan
 else:
     long_short_spread = np.nan
+
 def _long_hit_mask(returns: pd.Series, benchmark: float) -> pd.Series:
     if pd.isna(benchmark):
         return returns > 0
@@ -964,7 +1018,6 @@ if not returns_ready_sorted.empty:
         ignore_index=True,
     )
 
-
 if price_mode == "live":
     open_label = "Open (today)"
     last_label = "Last price"
@@ -989,7 +1042,7 @@ show = show.rename(columns={
 })
 
 # -----------------------
-# NEW: Robust rank⇄return metrics (no API calls; in-memory)
+# Robust rank⇄return metrics (no API calls; in-memory)
 # -----------------------
 def _winsorize_series(s: pd.Series, p: float) -> pd.Series:
     """Clip s to [p, 1-p] quantiles; p in [0, 0.5)."""
@@ -1052,8 +1105,6 @@ def _theil_sen_slope_via_deciles(x: pd.Series, y: pd.Series, bins: int = 10) -> 
     if d.shape[0] < 3:
         return np.nan
     bins = int(max(3, min(bins, d.shape[0] // 2)))
-    # bin by rank to evenly spread observations
-    # labels 1..bins with 1 = lowest x; we want x increasing with "better", so we will pass x as (-rank)
     try:
         q = pd.qcut(d["x"].rank(method="first"), q=bins, labels=False, duplicates="drop")
     except Exception:
@@ -1083,7 +1134,6 @@ def _compute_rank_metrics(
     if ready.empty:
         return pd.DataFrame(columns=["Focus", "Metric", "Value"]), pd.DataFrame(columns=["decile", "median_return"])
 
-    # Use negative rank so "higher is better" for correlation orientation
     ready["neg_rank"] = -ready["rank"].astype(float)
     returns_numeric = pd.to_numeric(ready["return_open_to_now"], errors="coerce")
     if pd.notna(benchmark):
@@ -1091,43 +1141,27 @@ def _compute_rank_metrics(
     else:
         ready["relevance"] = returns_numeric.clip(lower=0)
 
-    # Winsorize returns for Pearson-style only (Spearman/Kendall are rank-based)
     p = max(0.0, min(0.5, float(winsor_pct) / 100.0))
     ret_w = _winsorize_series(ready["return_open_to_now"], p)
 
-    # Correlations
     spearman = _spearman_corr(ready["neg_rank"], ready["return_open_to_now"])
     kendall  = _kendall_tau_b(ready["neg_rank"], ready["return_open_to_now"])
     pearson_w = _pearson_corr(ready["neg_rank"], ret_w)
 
-    # Theil–Sen slope (robust): y vs x where x = -rank
     ts_slope = _theil_sen_slope_via_deciles(ready["neg_rank"], ready["return_open_to_now"], bins=10)
     bps_per_10rank = (ts_slope * 10.0) * 10000.0 if pd.notna(ts_slope) else np.nan
 
-    # Top/Bottom-K medians + win rate
     k = int(min(topk, ready.shape[0] // 2 if ready.shape[0] >= 2 else topk))
     top = ready.nsmallest(k, "rank")  # rank 1..k
     bot = ready.nlargest(k, "rank")
     top_med = float(top["return_open_to_now"].median()) if not top.empty else np.nan
     bot_med_raw = float(bot["return_open_to_now"].median()) if not bot.empty else np.nan
     bot_med_short = -bot_med_raw if pd.notna(bot_med_raw) else np.nan
-    l_s_med = (
-        top_med + bot_med_short
-        if pd.notna(top_med) and pd.notna(bot_med_short)
-        else np.nan
-    )
-    top_win = (
-        float(_long_hit_mask(top["return_open_to_now"], benchmark).mean())
-        if not top.empty
-        else np.nan
-    )
-    bot_win = (
-        float(_short_hit_mask(bot["return_open_to_now"], benchmark).mean())
-        if not bot.empty
-        else np.nan
-    )
+    l_s_med = top_med + bot_med_short if pd.notna(top_med) and pd.notna(bot_med_short) else np.nan
 
-    # Ranking metrics @K (Top-K by predicted rank)
+    top_win = float(_long_hit_mask(top["return_open_to_now"], benchmark).mean()) if not top.empty else np.nan
+    bot_win = float(_short_hit_mask(bot["return_open_to_now"], benchmark).mean()) if not bot.empty else np.nan
+
     ready_sorted = ready.sort_values("rank")
     k_rank = int(max(1, min(topk, ready_sorted.shape[0])))
     rel = ready_sorted["relevance"].to_numpy()[:k_rank]
@@ -1160,45 +1194,19 @@ def _compute_rank_metrics(
         ("All ranks", "Theil–Sen slope (return per rank)", f"{ts_slope:.6f}" if pd.notna(ts_slope) else "—", "↑ more positive"),
         ("All ranks", "≈ bps per 10-rank improvement", f"{bps_per_10rank:.1f}" if pd.notna(bps_per_10rank) else "—", "↑ more positive"),
         ("Long bucket", f"Top-{k} median return", f"{top_med*100:.2f}%" if pd.notna(top_med) else "—", "↑ more positive"),
-        (
-            "Short bucket",
-            f"Bottom-{k} median short P&L",
-            f"{bot_med_short*100:.2f}%" if pd.notna(bot_med_short) else "—",
-            "↑ more positive",
-        ),
+        ("Short bucket", f"Bottom-{k} median short P&L", f"{bot_med_short*100:.2f}%" if pd.notna(bot_med_short) else "—", "↑ more positive"),
         ("Spread", f"Median long–short (Top-{k} + Short-{k})", f"{l_s_med*100:.2f}%" if pd.notna(l_s_med) else "—", "↑ wider"),
-        (
-            "Long bucket",
-            f"Top-{k} win rate (> benchmark)",
-            f"{top_win*100:.1f}%" if pd.notna(top_win) else "—",
-            "↑ toward 100%",
-        ),
-        (
-            "Short bucket",
-            f"Bottom-{k} win rate (< benchmark)",
-            f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—",
-            "↑ toward 100%",
-        ),
+        ("Long bucket", f"Top-{k} win rate (> benchmark)", f"{top_win*100:.1f}%" if pd.notna(top_win) else "—", "↑ toward 100%"),
+        ("Short bucket", f"Bottom-{k} short hit rate (< benchmark)", f"{bot_win*100:.1f}%" if pd.notna(bot_win) else "—", "↑ toward 100%"),
         ("Top-K", f"NDCG@{k_rank} (relevance from returns)", f"{ndcg_k:.3f}" if pd.notna(ndcg_k) else "—", "↑ toward 1"),
-        (
-            "Top-K",
-            f"MAP@{k_rank} (> benchmark returns as relevant)",
-            f"{map_k:.3f}" if pd.notna(map_k) else "—",
-            "↑ toward 1",
-        ),
-        (
-            "Top-K",
-            f"Precision@{k_rank} (> benchmark returns)",
-            f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—",
-            "↑ toward 100%",
-        ),
+        ("Top-K", f"MAP@{k_rank} (> benchmark returns as relevant)", f"{map_k:.3f}" if pd.notna(map_k) else "—", "↑ toward 1"),
+        ("Top-K", f"Precision@{k_rank} (> benchmark returns)", f"{precision_k*100:.1f}%" if pd.notna(precision_k) else "—", "↑ toward 100%"),
     ]
     metrics_tbl = pd.DataFrame(metrics_rows, columns=["Focus", "Metric", "Value", "Better ↗︎"])
 
     # Deciles by rank: 1 (best) → D (worst)
     D = int(min(10, max(3, ready.shape[0] // 10)))
     ready["decile"] = pd.qcut(ready["rank"], q=D, labels=False, duplicates="drop") if ready["rank"].nunique() > 1 else 0
-    # make 0 = best rank bucket
     deciles = (ready
                .groupby("decile", as_index=False)
                .agg(median_return=("return_open_to_now", "median"),
@@ -1219,6 +1227,33 @@ if deciles_tbl is not None and not deciles_tbl.empty:
     decile_label = deciles_chart_data.columns[0]
     deciles_chart_data = deciles_chart_data.rename(columns={decile_label: "rank_decile"})
     deciles_chart_data["rank_decile"] = deciles_chart_data["rank_decile"].astype(str)
+
+# --- NEW: Focused Top/Bottom K (K = 1, 2, 3) metrics ---
+def _build_focus_k_table(returns_sorted: pd.DataFrame, ks=(1, 2, 3), benchmark: float = np.nan) -> pd.DataFrame:
+    if returns_sorted is None or returns_sorted.empty:
+        return pd.DataFrame(columns=[
+            "K", "Top mean", "Top hit rate", "Bottom short mean", "Bottom hit rate", "Long–short spread", "Top tickers", "Bottom tickers"
+        ])
+    top_sorted = returns_sorted.sort_values("rank", ascending=True)
+    bot_sorted = returns_sorted.sort_values("rank", ascending=False)
+    rows = []
+    for k in ks:
+        topk = top_sorted.head(k)
+        botk = bot_sorted.head(k)
+        top_mean_k = float(topk["return_open_to_now"].mean()) if not topk.empty else np.nan
+        top_hit_k = float(_long_hit_mask(topk["return_open_to_now"], benchmark).mean()) if not topk.empty else np.nan
+        bot_short_mean_k = float((-botk["return_open_to_now"]).mean()) if not botk.empty else np.nan
+        bot_hit_k = float(_short_hit_mask(botk["return_open_to_now"], benchmark).mean()) if not botk.empty else np.nan
+        spread_k = (top_mean_k + bot_short_mean_k) if pd.notna(top_mean_k) and pd.notna(bot_short_mean_k) else np.nan
+        top_names = ", ".join(topk["ticker"].astype(str).tolist())
+        bot_names = ", ".join(botk["ticker"].astype(str).tolist())
+        rows.append((k, top_mean_k, top_hit_k, bot_short_mean_k, bot_hit_k, spread_k, top_names, bot_names))
+    tbl = pd.DataFrame(rows, columns=[
+        "K", "Top mean", "Top hit rate", "Bottom short mean", "Bottom hit rate", "Long–short spread", "Top tickers", "Bottom tickers"
+    ])
+    return tbl
+
+focus_k_tbl = _build_focus_k_table(returns_ready_sorted, ks=(1, 2, 3), benchmark=benchmark_return)
 
 baseline_overlap_tbl = pd.DataFrame()
 baseline_corr_tbl = pd.DataFrame()
@@ -1311,7 +1346,6 @@ if not baseline_ranked.empty:
     baseline_shift_up = _format_shift(baseline_shift_up)
     baseline_shift_down = _format_shift(baseline_shift_down)
 
-
 # -----------------------
 # UI
 # -----------------------
@@ -1343,6 +1377,7 @@ else:
 
 price_dim_lines.extend([
     f"joined_view:     {df_view.shape}",
+    f"focus_k_tbl:     {focus_k_tbl.shape}",
     f"mode:            {price_mode_label}",
 ])
 st.title("📈 Live LTR Monitor — Predictions vs Open→Now Returns (EODHD, rotating WS)")
@@ -1387,6 +1422,18 @@ if not returns_ready_sorted.empty:
             _fmt_pct_display(bottom_win_rate),
             delta=_fmt_delta_points(bottom_win_rate - 0.5) if pd.notna(bottom_win_rate) else None,
         )
+
+    # --- NEW: Focused Top/Bottom 1–3 table ---
+    st.subheader("🎯 Focused Top/Bottom K (K = 1, 2, 3)")
+    if not focus_k_tbl.empty:
+        fmt_tbl = focus_k_tbl.copy()
+        for col in ["Top mean", "Bottom short mean", "Long–short spread"]:
+            fmt_tbl[col] = fmt_tbl[col].apply(lambda x: "" if pd.isna(x) else f"{x*100:.2f}%")
+        fmt_tbl["Top hit rate"] = fmt_tbl["Top hit rate"].apply(lambda x: "" if pd.isna(x) else f"{x*100:.1f}%")
+        fmt_tbl["Bottom hit rate"] = fmt_tbl["Bottom hit rate"].apply(lambda x: "" if pd.isna(x) else f"{x*100:.1f}%")
+        st.dataframe(fmt_tbl, use_container_width=True, height=180)
+    else:
+        st.info("Focused Top/Bottom K metrics will appear once realized returns are available.")
 
 left, right = st.columns([3, 2], gap="large")
 with left:

@@ -322,7 +322,7 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
         st.error("Missing required column(s): " + ", ".join(missing))
         st.stop()
 
-    out = df.rename(columns={ticker_col: "ticker", pred_col: "prediction"})
+    out = df.rename(columns={ticker_col: "ticker", pred_col: "prediction"}).copy()
     if date_col: out = out.rename(columns={date_col: "date"})
     if asof_col: out = out.rename(columns={asof_col: "as_of"})
 
@@ -330,6 +330,13 @@ def _normalize_predictions(df: pd.DataFrame) -> pd.DataFrame:
     out["prediction"] = pd.to_numeric(out["prediction"], errors="coerce")
     if "date" in out.columns:
         out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.date
+    else:
+        assumed_date = datetime.now(tz=NY).date()
+        out["date"] = assumed_date
+        st.caption(
+            "🕒 No `date` column found in predictions; assuming current NY session "
+            f"({assumed_date})."
+        )
 
     if "as_of" in out.columns:
         def _parse_asof(x):
